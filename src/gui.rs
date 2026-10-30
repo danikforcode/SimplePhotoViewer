@@ -68,6 +68,23 @@ pub const IC_SETTINGS: u32 = 0xE713;
 pub const IC_COPY: u32 = 0xE8C8;
 pub const IC_PASTE: u32 = 0xE77F;
 pub const IC_CHECK: u32 = 0xE73E;
+pub const IC_CLOSE: u32 = 0xE711;
+pub const IC_PLAY: u32 = 0xE768;
+pub const IC_PAUSE: u32 = 0xE769;
+pub const IC_VOLUME: u32 = 0xE767;
+pub const IC_MUTE: u32 = 0xE74F;
+pub const IC_REPEAT: u32 = 0xE8EE;
+pub const IC_CAMERA: u32 = 0xE722;
+pub const IC_CONVERT: u32 = 0xE8AB;
+pub const IC_FIND: u32 = 0xE721;
+pub const IC_WRAP: u32 = 0xE751;
+pub const IC_BOOK: u32 = 0xE736;
+pub const IC_SCROLL: u32 = 0xE8C4;
+pub const IC_SORT: u32 = 0xE8CB;
+pub const IC_TABLE_HEAD: u32 = 0xE8A4;
+pub const IC_MORE: u32 = 0xE712;
+pub const IC_REDO: u32 = 0xE7A6;
+pub const IC_SPEED: u32 = 0xEC4A;
 pub const IC_PICTURE: u32 = 0xE8B9;
 pub const IC_RESET: u32 = 0xE72C;
 
@@ -591,6 +608,12 @@ pub trait Panel {
     fn min_size(&self) -> (i32, i32) {
         (480, 360)
     }
+    /// Сырые сообщения окна, которые не разбирает хозяин: WM_COMMAND/WM_NOTIFY
+    /// от системных элементов, WM_CTLCOLOR*, WM_APP+n от фоновых потоков.
+    /// Some(результат) — обработано.
+    fn raw(&mut self, _hwnd: HWND, _msg: u32, _wp: WPARAM, _lp: LPARAM) -> Option<LRESULT> {
+        None
+    }
 }
 
 // -------------------------------------------------------------------- окно ---
@@ -654,25 +677,45 @@ fn paint(hwnd: HWND, h: &Host) {
         let _ = GetClientRect(hwnd, &mut rc);
         let (w, ht) = (rc.right.max(1), rc.bottom.max(1));
         let mem = CreateCompatibleDC(hdc);
-        {
-            let mut st = h.st.borrow_mut();
-            if st.back.is_invalid() || st.bw != w || st.bh != ht {
-                if !st.back.is_invalid() {
-                    let _ = DeleteObject(st.back);
+        // 1) задний буфер — короткое заимствование состояния
+        let back = match h.st.try_borrow_mut() {
+            Ok(mut st) => {
+                if st.back.is_invalid() || st.bw != w || st.bh != ht {
+                    if !st.back.is_invalid() {
+                        let _ = DeleteObject(st.back);
+                    }
+                    st.back = CreateCompatibleBitmap(hdc, w, ht);
+                    (st.bw, st.bh) = (w, ht);
+                    let o = SelectObject(mem, st.back);
+                    fill(mem, &rc, theme::cur().bg);
+                    SelectObject(mem, o);
                 }
-                st.back = CreateCompatibleBitmap(hdc, w, ht);
-                (st.bw, st.bh) = (w, ht);
-                // нечего показывать из старого кадра — зальём фоном
-                let o = SelectObject(mem, st.back);
-                fill(mem, &rc, theme::cur().bg);
-                SelectObject(mem, o);
+                st.back
             }
-            let old = SelectObject(mem, st.back);
-            if let Ok(mut p) = h.panel.try_borrow_mut() {
+            Err(_) => HBITMAP::default(),
+        };
+        if back.is_invalid() {
+            let _ = DeleteDC(mem);
+            let _ = EndPaint(hwnd, &ps);
+            return;
+        }
+        let old = SelectObject(mem, back);
+        // 2) панель рисует, не держа состояние окна: внутри может крутиться
+        //    очередь сообщений (драйвер принтера, COM), и вложенные сообщения
+        //    не должны натыкаться на занятое состояние
+        let drawn = match h.panel.try_borrow_mut() {
+            Ok(mut p) => {
                 let ui = Ui::new(dpi_of(hwnd));
-                st.ws = p.layout(&ui, w, ht);
+                let ws = p.layout(&ui, w, ht);
                 p.paint(&ui, mem, w, ht);
-                drop(p);
+                Some((ui, ws))
+            }
+            Err(_) => None,
+        };
+        // 3) элементы и подсказка
+        if let Some((ui, ws)) = drawn {
+            if let Ok(mut st) = h.st.try_borrow_mut() {
+                st.ws = ws;
                 let (mx, my) = st.mouse;
                 st.hover = hit(&st.ws, mx, my);
                 st.hover_item = st.hover.and_then(|i| {
@@ -684,18 +727,14 @@ fn paint(hwnd: HWND, h: &Host) {
                     let pr = hov && st.press.map(|(id, k)| id == wd.id && k == wd.kind).unwrap_or(false) && wd.kind != Kind::List;
                     draw_w(&ui, mem, wd, hov, pr, if hov { st.hover_item } else { None });
                 }
-                // подсказка
                 if st.tip && st.press.is_none() {
                     if let Some(wd) = st.hover.map(|i| &st.ws[i]).filter(|wd| !wd.tip.is_empty()) {
                         let tw = ui.tw(ui.f.text, &wd.tip) + ui.s(16);
                         let th = ui.s(26);
-                        let mut x = mx.min(w - tw - ui.s(4)).max(ui.s(4));
+                        let x = mx.min(w - tw - ui.s(4)).max(ui.s(4)).max(0);
                         let mut y = wd.rc.bottom + ui.s(6);
                         if y + th > ht {
                             y = wd.rc.top - th - ui.s(6);
-                        }
-                        if x < 0 {
-                            x = 0;
                         }
                         let b = r(x, y, tw, th);
                         round(mem, &b, ui.s(6), Some(ui.t.tip_bg), None);
@@ -703,9 +742,9 @@ fn paint(hwnd: HWND, h: &Host) {
                     }
                 }
             }
-            let _ = BitBlt(hdc, 0, 0, w, ht, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, old);
         }
+        let _ = BitBlt(hdc, 0, 0, w, ht, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
         let _ = DeleteDC(mem);
         let _ = EndPaint(hwnd, &ps);
     }
@@ -722,13 +761,15 @@ fn dispatch(hwnd: HWND, h: &Host, f: impl FnOnce(&mut dyn Panel) -> bool) {
         Err(_) => None,
     };
     if let Some((keep, t)) = res {
-        let changed = {
-            let mut st = h.st.borrow_mut();
-            let c = st.title != t;
-            if c {
-                st.title = t.clone();
+        let changed = match h.st.try_borrow_mut() {
+            Ok(mut st) => {
+                let c = st.title != t;
+                if c {
+                    st.title = t.clone();
+                }
+                c
             }
-            c
+            Err(_) => true,
         };
         if changed {
             unsafe {
@@ -749,8 +790,8 @@ fn xy(lp: LPARAM) -> (i32, i32) {
 }
 
 fn set_hover(hwnd: HWND, h: &Host, x: i32, y: i32) {
+    let Ok(mut st) = h.st.try_borrow_mut() else { return };
     let (changed, has_tip) = {
-        let mut st = h.st.borrow_mut();
         st.mouse = (x, y);
         let nh = hit(&st.ws, x, y);
         let ni = nh.and_then(|i| {
@@ -765,6 +806,7 @@ fn set_hover(hwnd: HWND, h: &Host, x: i32, y: i32) {
         st.hover_item = ni;
         (changed, nh.map(|i| !st.ws[i].tip.is_empty()).unwrap_or(false))
     };
+    drop(st);
     if changed {
         unsafe {
             let _ = KillTimer(hwnd, TIP_TIMER);
@@ -840,7 +882,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let _ = ScreenToClient(hwnd, &mut pt);
-                    let over_widget = h.st.borrow().ws.iter().any(|w| inside(&w.rc, pt.x, pt.y) && w.clickable());
+                    let over_widget = h.st.try_borrow().map(|st| st.ws.iter().any(|w| inside(&w.rc, pt.x, pt.y) && w.clickable())).unwrap_or(false);
                     let cur = if over_widget { None } else { h.panel.try_borrow().ok().and_then(|p| p.cursor(pt.x, pt.y)) };
                     SetCursor(LoadCursorW(None, cur.unwrap_or(IDC_ARROW)).unwrap_or_default());
                     return LRESULT(1);
@@ -849,7 +891,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_MOUSEMOVE => {
                 let (x, y) = xy(lp);
-                if !h.st.borrow().tracking {
+                if !h.st.try_borrow().map(|st| st.tracking).unwrap_or(true) {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                         dwFlags: TME_LEAVE,
@@ -857,12 +899,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                         dwHoverTime: 0,
                     };
                     let _ = TrackMouseEvent(&mut tme);
-                    h.st.borrow_mut().tracking = true;
+                    if let Ok(mut st) = h.st.try_borrow_mut() {
+                        st.tracking = true;
+                    }
                 }
                 set_hover(hwnd, h, x, y);
-                let pressing = h.st.borrow().press.is_some();
+                let (pressing, over) = h.st.try_borrow().map(|st| (st.press.is_some(), st.hover.is_some())).unwrap_or((true, true));
                 if !pressing {
-                    let over = h.st.borrow().hover.is_some();
                     if !over || GetCapture() == hwnd {
                         let redraw = h.panel.try_borrow_mut().map(|mut p| p.mouse(hwnd, Mouse::Move, x, y)).unwrap_or(false);
                         if redraw {
@@ -873,8 +916,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
-                {
-                    let mut st = h.st.borrow_mut();
+                if let Ok(mut st) = h.st.try_borrow_mut() {
                     st.tracking = false;
                 }
                 if GetCapture() != hwnd {
@@ -885,10 +927,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN => {
                 let (x, y) = xy(lp);
                 set_hover(hwnd, h, x, y);
-                let target = {
-                    let st = h.st.borrow();
-                    st.hover.map(|i| st.ws[i].clone()).filter(|w| w.clickable())
-                };
+                let target = h.st.try_borrow().ok().and_then(|st| st.hover.and_then(|i| st.ws.get(i).cloned()).filter(|w| w.clickable()));
                 if msg == WM_RBUTTONDOWN {
                     if target.is_none() {
                         dispatch(hwnd, h, |p| {
@@ -901,7 +940,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 match target {
                     Some(w) => {
                         let _ = KillTimer(hwnd, TIP_TIMER);
-                        h.st.borrow_mut().tip = false;
+                        if let Ok(mut st) = h.st.try_borrow_mut() {
+                            st.tip = false;
+                        }
                         if w.kind == Kind::List {
                             if let Some(k) = list_item(dpi_of(hwnd), &w, y) {
                                 let ev = if msg == WM_LBUTTONDBLCLK { Ev::Dbl(w.id, k) } else { Ev::Item(w.id, k) };
@@ -911,7 +952,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                             // быстрый второй щелчок по кнопке — ещё одно нажатие
                             dispatch(hwnd, h, |p| p.event(hwnd, Ev::Click(w.id)));
                         } else {
-                            h.st.borrow_mut().press = Some((w.id, w.kind));
+                            if let Ok(mut st) = h.st.try_borrow_mut() {
+                                st.press = Some((w.id, w.kind));
+                            }
                             SetCapture(hwnd);
                             invalidate(hwnd);
                         }
@@ -930,14 +973,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_LBUTTONUP => {
                 let (x, y) = xy(lp);
                 let _ = ReleaseCapture();
-                let pressed = h.st.borrow_mut().press.take();
+                let pressed = h.st.try_borrow_mut().ok().and_then(|mut st| st.press.take());
                 set_hover(hwnd, h, x, y);
                 match pressed {
                     Some((id, kind)) => {
-                        let same = {
-                            let st = h.st.borrow();
-                            st.hover.map(|i| st.ws[i].id == id && st.ws[i].kind == kind).unwrap_or(false)
-                        };
+                        let same = h
+                            .st
+                            .try_borrow()
+                            .map(|st| st.hover.and_then(|i| st.ws.get(i)).map(|w| w.id == id && w.kind == kind).unwrap_or(false))
+                            .unwrap_or(false);
                         if same {
                             dispatch(hwnd, h, |p| p.event(hwnd, Ev::Click(id)));
                         }
@@ -954,10 +998,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
                 let mut pt = POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 };
                 let _ = ScreenToClient(hwnd, &mut pt);
-                let target = {
-                    let st = h.st.borrow();
+                let target = h.st.try_borrow().ok().and_then(|st| {
                     st.ws.iter().rev().find(|w| inside(&w.rc, pt.x, pt.y) && w.enabled && (w.wheel.is_some() || w.kind == Kind::List)).cloned()
-                };
+                });
                 match target {
                     Some(w) if w.kind == Kind::List => {
                         let d = if delta > 0 { -3 } else { 3 };
@@ -977,7 +1020,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = wp.0 as u16;
-                if msg == WM_SYSKEYDOWN && vk != VK_F10.0 {
+                // Alt+← / Alt+→ — листание файлов, остальное с Alt — системе (меню окна)
+                if msg == WM_SYSKEYDOWN && vk != VK_F10.0 && vk != VK_LEFT.0 && vk != VK_RIGHT.0 {
                     return DefWindowProcW(hwnd, msg, wp, lp);
                 }
                 let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
@@ -998,14 +1042,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_TIMER => {
                 if wp.0 == TIP_TIMER {
                     let _ = KillTimer(hwnd, TIP_TIMER);
-                    h.st.borrow_mut().tip = true;
+                    if let Ok(mut st) = h.st.try_borrow_mut() {
+                        st.tip = true;
+                    }
                     invalidate(hwnd);
                 } else {
                     let id = wp.0;
-                    dispatch(hwnd, h, |p| {
-                        p.timer(hwnd, id);
-                        true
-                    });
+                    // перерисовка — только если панель попросила (таймеры анимации частые)
+                    let redraw = h.panel.try_borrow_mut().map(|mut p| p.timer(hwnd, id)).unwrap_or(false);
+                    if redraw {
+                        dispatch(hwnd, h, |_| true);
+                    }
                 }
                 LRESULT(0)
             }
@@ -1052,12 +1099,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if !p.is_null() {
                     let b = Box::from_raw(p);
-                    let st = b.st.borrow();
-                    if !st.back.is_invalid() {
-                        let _ = DeleteObject(st.back);
+                    let back = b.st.try_borrow().map(|st| st.back).unwrap_or_default();
+                    if !back.is_invalid() {
+                        let _ = DeleteObject(back);
                     }
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_COMMAND | WM_NOTIFY | WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_HSCROLL | WM_VSCROLL => {
+                let r = h.panel.try_borrow_mut().ok().and_then(|mut p| p.raw(hwnd, msg, wp, lp));
+                r.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
+            }
+            m if m >= WM_APP => {
+                let mut res = None;
+                dispatch(hwnd, h, |p| {
+                    res = p.raw(hwnd, m, wp, lp);
+                    true
+                });
+                res.unwrap_or(LRESULT(0))
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
@@ -1090,7 +1149,7 @@ pub fn create(owner: Option<HWND>, panel: Rc<RefCell<dyn Panel>>, size: (i32, i3
     unsafe {
         let owner_h = owner.unwrap_or_default();
         let dpi = if owner.is_some() { dpi_of(owner_h) } else { GetDpiForSystem().max(96) };
-        let style = WS_OVERLAPPEDWINDOW;
+        let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
         let ex = WINDOW_EX_STYLE(0);
         let mut rc = r(0, 0, size.0 * dpi as i32 / 96, size.1 * dpi as i32 / 96);
         let _ = AdjustWindowRectExForDpi(&mut rc, style, false, ex, dpi);
@@ -1140,6 +1199,9 @@ pub fn run_modal<P: Panel + 'static>(owner: HWND, p: P, size: (i32, i32)) -> P {
             if r == -1 {
                 break;
             }
+            if forward_key(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1151,11 +1213,43 @@ pub fn run_modal<P: Panel + 'static>(owner: HWND, p: P, size: (i32, i32)) -> P {
     }
 }
 
+/// Горячие клавиши программы, нажатые во встроенном редакторе или поле
+/// поиска, отдаём главному окну (иначе их «съест» системный элемент).
+fn forward_key(msg: &MSG) -> bool {
+    unsafe {
+        if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
+            return false;
+        }
+        let root = GetAncestor(msg.hwnd, GA_ROOT);
+        if root == msg.hwnd || host(root).is_none() {
+            return false;
+        }
+        let vk = msg.wParam.0 as u16;
+        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+        let mut cls = [0u16; 16];
+        let n = GetClassNameW(msg.hwnd, &mut cls);
+        let is_edit = String::from_utf16_lossy(&cls[..n.max(0) as usize]).eq_ignore_ascii_case("Edit");
+        let global = (ctrl && matches!(vk, 0x4F | 0x53 | 0x50 | 0x46 | 0x48 | 0x47 | 0x4D | 0x51 | 0x09 | 0x21 | 0x22 | 0x57))
+            || matches!(vk, 0x70 | 0x72 | 0x7A)
+            || (vk == VK_ESCAPE.0)
+            || (is_edit && vk == VK_RETURN.0)
+            || (msg.message == WM_SYSKEYDOWN && (vk == VK_LEFT.0 || vk == VK_RIGHT.0));
+        if global {
+            SendMessageW(root, msg.message, msg.wParam, msg.lParam);
+            return true;
+        }
+        false
+    }
+}
+
 /// Главный цикл сообщений.
 pub fn message_loop() {
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if forward_key(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1184,4 +1278,35 @@ pub fn segments(ui: &Ui, x: i32, y: i32, w: i32, base_id: u32, labels: &[&str], 
         .enumerate()
         .map(|(i, l)| W::new(Kind::Seg, base_id + i as u32, r(x + i as i32 * (bw + gap), y, bw, ui.s(32))).t(*l).on(i == cur))
         .collect()
+}
+
+/// Выпадающее меню (системное) у точки клиента; возвращает выбранный id или 0.
+pub fn popup_menu(hwnd: HWND, x: i32, y: i32, items: &[(u32, String, bool)]) -> u32 {
+    unsafe {
+        let Ok(m) = CreatePopupMenu() else { return 0 };
+        for (id, text, checked) in items {
+            if *id == 0 {
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
+                continue;
+            }
+            let w = wide(text);
+            let fl = if *checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(m, fl, *id as usize, PCWSTR(w.as_ptr()));
+        }
+        let mut pt = POINT { x, y };
+        let _ = ClientToScreen(hwnd, &mut pt);
+        let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd, None).0 as u32;
+        let _ = DestroyMenu(m);
+        cmd
+    }
+}
+
+/// Последнее положение мыши, известное окну (для меню и подсказок).
+pub fn mouse_pos(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = ScreenToClient(hwnd, &mut pt);
+        (pt.x, pt.y)
+    }
 }

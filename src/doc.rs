@@ -26,6 +26,8 @@ pub enum Src {
     /// size — в пунктах, как его отдаёт Windows (с учётом /Rotate файла).
     Pdf { path: PathBuf, index: u32, size: (f64, f64) },
     Mem(String),
+    /// Страница документа (DOCX/ODT/RTF/Markdown), разложенного RichEdit.
+    Rich { path: PathBuf, doc: Rc<crate::richdoc::RichDoc>, index: u32 },
 }
 
 #[derive(Clone)]
@@ -52,9 +54,13 @@ impl Page {
     pub fn is_pdf(&self) -> bool {
         matches!(self.src, Src::Pdf { .. })
     }
+    /// Страница документа (PDF или DOCX/ODT/…): вписывается в окно всегда, поворачивается без потерь.
+    pub fn is_docpage(&self) -> bool {
+        matches!(self.src, Src::Pdf { .. } | Src::Rich { .. })
+    }
     pub fn path(&self) -> Option<&Path> {
         match &self.src {
-            Src::File(p) | Src::Pdf { path: p, .. } => Some(p),
+            Src::File(p) | Src::Pdf { path: p, .. } | Src::Rich { path: p, .. } => Some(p),
             Src::Mem(_) => None,
         }
     }
@@ -65,6 +71,7 @@ impl Page {
             Src::File(p) => format!("{}{star}", file_name(p)),
             Src::Pdf { path, index, .. } => format!("{} — стр. {}{star}", file_name(path), index + 1),
             Src::Mem(n) => n.clone(),
+            Src::Rich { path, index, .. } => format!("{} — стр. {}{star}", file_name(path), index + 1),
         }
     }
     /// Размер листа в пунктах (для PDF-страниц), с учётом поворотов и правок.
@@ -74,6 +81,10 @@ impl Page {
         }
         match &self.src {
             Src::Pdf { size, .. } if self.img.is_none() => Some(if self.rot % 2 == 1 { (size.1, size.0) } else { *size }),
+            Src::Rich { doc, .. } if self.img.is_none() => {
+                let s = doc.size_pt();
+                Some(if self.rot % 2 == 1 { (s.1, s.0) } else { s })
+            }
             _ => None,
         }
     }
@@ -102,6 +113,9 @@ pub fn pages_from(path: &Path) -> Result<Vec<Page>, String> {
             .enumerate()
             .map(|(i, s)| Page { src: Src::Pdf { path: path.to_path_buf(), index: i as u32, size: *s }, rot: 0, img: None, ppx: None })
             .collect())
+    } else if crate::kinds::kind_of(path) == Some(crate::kinds::Kind::Doc) {
+        let doc = Rc::new(crate::richdoc::RichDoc::open(path).map_err(|e| format!("{}:\n{e}", file_name(path)))?);
+        Ok((0..doc.pages() as u32).map(|i| Page { src: Src::Rich { path: path.to_path_buf(), doc: doc.clone(), index: i }, rot: 0, img: None, ppx: None }).collect())
     } else if crate::files::is_image(path) {
         Ok(vec![Page::file(path.to_path_buf())])
     } else {
@@ -135,6 +149,13 @@ pub fn render(page: &Page, dpi: f64) -> Result<Rc<Img>, String> {
             crate::pdf_read::render(path, *index, w).map_err(|e| format!("{}, стр. {}:\n{e}", file_name(path), index + 1))?
         }
         Src::Mem(_) => return Err("пустая страница".into()),
+        Src::Rich { doc, index, .. } => {
+            let i = doc.render(*index, dpi.min(300.0))?;
+            if page.rot % 4 == 0 {
+                return Ok(i);
+            }
+            (*i).clone()
+        }
     };
     Ok(Rc::new(rot_q(img, page.rot)))
 }
@@ -167,7 +188,7 @@ pub fn to_out(pages: &[Page], photo: PhotoPage, margin_mm: f64) -> Result<Vec<Ou
             Some(s) => (s, (0.0, 0.0, s.0, s.1)),
             None => pdf_write::photo_layout(px, photo, margin_mm),
         };
-        out.push(OutPage::Raster { page, items: vec![Placed { jpeg, px, place }] });
+        out.push(OutPage::Raster { page, items: vec![Placed { jpeg, px, place, angle: 0.0 }] });
     }
     Ok(out)
 }

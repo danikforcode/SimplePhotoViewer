@@ -13,6 +13,7 @@ use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetH
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
+
 pub fn init() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -118,6 +119,14 @@ fn decode(f: &IWICImagingFactory, dec: &IWICBitmapDecoder, exif: Option<u16>) ->
 }
 
 pub fn load(path: &Path) -> Result<Img> {
+    let ext = crate::util::ext_lower(path);
+    if matches!(ext.as_str(), "tga" | "pnm" | "ppm" | "pgm" | "pbm" | "qoi") {
+        let bytes = std::fs::read(path).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
+        return match crate::imgfmt::decode_own(&ext, &bytes) {
+            Some(r) => r.map_err(|e| Error::new(E_FAIL, e)),
+            None => Err(Error::from(E_FAIL)),
+        };
+    }
     unsafe {
         let f = factory()?;
         let p = crate::util::wpath(path);
@@ -142,70 +151,118 @@ fn container_for(ext: &str) -> GUID {
         "png" => GUID_ContainerFormatPng,
         "bmp" => GUID_ContainerFormatBmp,
         "tif" | "tiff" => GUID_ContainerFormatTiff,
+        "gif" => GUID_ContainerFormatGif,
+        "jxr" | "wdp" | "hdp" => GUID_ContainerFormatWmp,
+        "heic" | "heif" => GUID_ContainerFormatHeif,
         _ => GUID_ContainerFormatJpeg,
     }
 }
 
-fn encode_to(f: &IWICImagingFactory, img: &Img, stream: &IStream, container: &GUID) -> Result<()> {
+/// Качество JPEG по умолчанию (0..100).
+pub fn jpeg_quality() -> i32 {
+    crate::settings::get_i("jpeg_quality", 92).clamp(10, 100)
+}
+
+fn encode_to(f: &IWICImagingFactory, img: &Img, stream: &IStream, container: &GUID, quality: i32) -> Result<()> {
     unsafe {
         let enc = f.CreateEncoder(container, std::ptr::null())?;
         enc.Initialize(stream, WICBitmapEncoderNoCache)?;
         let mut frame: Option<IWICBitmapFrameEncode> = None;
-        enc.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
+        let mut bag: Option<windows::Win32::System::Com::StructuredStorage::IPropertyBag2> = None;
+        enc.CreateNewFrame(&mut frame, &mut bag)?;
         let frame = frame.ok_or_else(|| Error::from(E_FAIL))?;
-        frame.Initialize(None)?;
+        // качество сжатия: JPEG, JPEG XR, HEIF понимают «ImageQuality» (0.0–1.0)
+        if let (Some(b), true) = (&bag, *container != GUID_ContainerFormatPng && *container != GUID_ContainerFormatBmp && *container != GUID_ContainerFormatGif && *container != GUID_ContainerFormatTiff) {
+            let mut name = crate::util::wide("ImageQuality");
+            let pb = windows::Win32::System::Com::StructuredStorage::PROPBAG2 {
+                pstrName: windows::core::PWSTR(name.as_mut_ptr()),
+                ..Default::default()
+            };
+            let v = windows::core::VARIANT::from(quality as f32 / 100.0);
+            let _ = b.Write(1, &pb, &v);
+        }
+        frame.Initialize(bag.as_ref())?;
         frame.SetSize(img.w, img.h)?;
-        let mut pf = GUID_WICPixelFormat24bppBGR;
-        frame.SetPixelFormat(&mut pf)?;
         let bmp = f.CreateBitmapFromMemory(img.w, img.h, &GUID_WICPixelFormat32bppBGRA, img.w * 4, &img.px)?;
-        frame.WriteSource(&bmp, std::ptr::null())?;
+        if *container == GUID_ContainerFormatGif {
+            // GIF — 256 цветов: строим палитру по картинке и переводим в индексы
+            let pal = f.CreatePalette()?;
+            pal.InitializeFromBitmap(&bmp, 256, false)?;
+            let conv = f.CreateFormatConverter()?;
+            conv.Initialize(&bmp, &GUID_WICPixelFormat8bppIndexed, WICBitmapDitherTypeErrorDiffusion, &pal, 0.0, WICBitmapPaletteTypeCustom)?;
+            let mut pf = GUID_WICPixelFormat8bppIndexed;
+            frame.SetPixelFormat(&mut pf)?;
+            frame.SetPalette(&pal)?;
+            frame.WriteSource(&conv, std::ptr::null())?;
+        } else {
+            let mut pf = GUID_WICPixelFormat24bppBGR;
+            frame.SetPixelFormat(&mut pf)?;
+            frame.WriteSource(&bmp, std::ptr::null())?;
+        }
         frame.Commit()?;
         enc.Commit()?;
         Ok(())
     }
 }
 
-pub fn save(img: &Img, path: &Path) -> Result<()> {
-    unsafe {
-        let f = factory()?;
-        let container = container_for(&crate::util::ext_lower(path));
-        // пишем во временный файл и переименовываем: исходник не испортится при сбое
-        let tmp = path.with_extension("spv-tmp");
-        let p = crate::util::wpath(&tmp);
-        let res = (|| -> Result<()> {
-            let stream = f.CreateStream()?;
-            stream.InitializeFromFilename(PCWSTR(p.as_ptr()), 0x4000_0000)?; // GENERIC_WRITE
-            encode_to(&f, img, &stream.cast()?, &container)
-        })();
-        if let Err(e) = res {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            Error::new(E_FAIL, e.to_string())
-        })
-    }
-}
-
-/// JPEG в память (для вставки страниц-картинок в PDF).
-pub fn encode_jpeg(img: &Img) -> Result<Vec<u8>> {
+/// Закодировать в память (JPEG, PNG и т.д.).
+pub fn encode_mem(img: &Img, ext: &str, quality: i32) -> Result<Vec<u8>> {
     unsafe {
         let f = factory()?;
         let stream = CreateStreamOnHGlobal(None, true)?;
-        encode_to(&f, img, &stream, &GUID_ContainerFormatJpeg)?;
+        encode_to(&f, img, &stream, &container_for(ext), quality)?;
         let hg = GetHGlobalFromStream(&stream)?;
-        let n = GlobalSize(hg);
+        // реальный размер данных — позиция потока после записи
+        let mut len = 0u64;
+        stream.Seek(0, windows::Win32::System::Com::STREAM_SEEK_CUR, Some(&mut len))?;
+        let len = len as usize;
+        let n = GlobalSize(hg).min(len.max(1));
         let p = GlobalLock(hg) as *const u8;
         if p.is_null() {
             return Err(Error::from(E_FAIL));
         }
         let v = std::slice::from_raw_parts(p, n).to_vec();
         let _ = GlobalUnlock(hg);
-        // GlobalSize может быть больше записанного: обрежем по маркеру конца JPEG
-        let end = v.windows(2).rposition(|w| w == [0xFF, 0xD9]).map(|i| i + 2).unwrap_or(v.len());
-        Ok(v[..end].to_vec())
+        Ok(v)
     }
+}
+
+/// JPEG в память (для вставки страниц-картинок в PDF).
+pub fn encode_jpeg(img: &Img) -> Result<Vec<u8>> {
+    encode_mem(img, "jpg", jpeg_quality())
+}
+
+/// Иконка .ico: набор размеров до 256 (картинка вписывается в квадрат).
+fn encode_ico(img: &Img) -> Result<Vec<u8>> {
+    let side = img.w.max(img.h);
+    let mut sq = Img::filled(side, side, [255, 255, 255]);
+    sq.draw(img, ((side - img.w) / 2) as i32, ((side - img.h) / 2) as i32);
+    let mut parts = vec![];
+    for s in [16u32, 24, 32, 48, 64, 128, 256] {
+        if s > side && !parts.is_empty() {
+            break;
+        }
+        let r = resize(&sq, s, s)?;
+        parts.push((s, encode_mem(&r, "png", 100)?));
+    }
+    Ok(crate::imgfmt::build_ico(&parts))
+}
+
+pub fn save(img: &Img, path: &Path) -> Result<()> {
+    save_q(img, path, jpeg_quality())
+}
+
+/// Сохранить с заданным качеством (для JPEG/JPEG XR/HEIF).
+pub fn save_q(img: &Img, path: &Path, quality: i32) -> Result<()> {
+    let ext = crate::util::ext_lower(path);
+    let data = if ext == "ico" { encode_ico(img)? } else { encode_mem(img, &ext, quality)? };
+    // пишем во временный файл и переименовываем: исходник не испортится при сбое
+    let tmp = path.with_extension("spv-tmp");
+    std::fs::write(&tmp, &data).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        Error::new(E_FAIL, e.to_string())
+    })
 }
 
 /// Качественное масштабирование (Fant) — для «Размер», печати, коллажа.

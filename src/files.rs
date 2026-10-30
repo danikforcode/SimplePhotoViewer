@@ -8,17 +8,15 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Controls::Dialogs::*;
 
-pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff", "heic", "heif", "jfif"];
-
 pub fn is_image(p: &Path) -> bool {
-    IMAGE_EXTS.contains(&crate::util::ext_lower(p).as_str())
+    crate::kinds::kind_of(p) == Some(crate::kinds::Kind::Image)
 }
 
 pub fn is_supported(p: &Path) -> bool {
-    is_image(p) || crate::util::is_pdf(p)
+    crate::kinds::is_supported(p)
 }
 
-/// Все фото и PDF в папке файла, по алфавиту, + индекс текущего.
+/// Все поддерживаемые файлы в папке, по алфавиту, + индекс текущего.
 pub fn siblings(path: &Path) -> (Vec<PathBuf>, isize) {
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let dir = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir };
@@ -44,10 +42,10 @@ pub enum Pick {
 
 /// Диалог открытия; можно выбрать несколько файлов.
 pub fn open_dialog(hwnd: HWND, pick: Pick, multi: bool) -> Vec<PathBuf> {
-    let imgs: Vec<String> = IMAGE_EXTS.iter().map(|e| format!("*.{e}")).collect();
+    let imgs: Vec<String> = crate::kinds::IMAGE.iter().map(|e| format!("*.{e}")).collect();
     let imgs = imgs.join(";");
     let filter_s = match pick {
-        Pick::Any => format!("Фото и PDF\0{imgs};*.pdf\0Изображения\0{imgs}\0PDF\0*.pdf\0Все файлы\0*.*\0\0"),
+        Pick::Any => crate::kinds::open_filter(),
         Pick::Images => format!("Изображения\0{imgs}\0Все файлы\0*.*\0\0"),
     };
     let filter: Vec<u16> = filter_s.encode_utf16().collect();
@@ -100,28 +98,28 @@ fn parse_multi(buf: &[u16]) -> Vec<PathBuf> {
     }
 }
 
-/// Форматы в диалоге сохранения (порядок = индекс фильтра − 1).
-const SAVE_EXTS: [&str; 5] = ["jpg", "png", "bmp", "tif", "pdf"];
-
-/// Диалог «Сохранить как». prefer_pdf — выбрать PDF по умолчанию; only_pdf — только PDF.
-pub fn save_dialog(hwnd: HWND, default_name: &str, initial_dir: Option<&Path>, prefer_pdf: bool, only_pdf: bool) -> Option<PathBuf> {
-    let filter_s = if only_pdf {
-        "PDF\0*.pdf\0\0"
-    } else {
-        "JPEG\0*.jpg;*.jpeg\0PNG\0*.png\0BMP\0*.bmp\0TIFF\0*.tif;*.tiff\0PDF\0*.pdf\0\0"
-    };
-    let filter: Vec<u16> = filter_s.encode_utf16().collect();
+/// Общий диалог «Сохранить как». filters — (подпись, расширения), idx — выбранный с нуля.
+/// Если имя без известного расширения, добавляется первое расширение выбранного фильтра.
+pub fn save_as(hwnd: HWND, default_name: &str, initial_dir: Option<&Path>, filters: &[(&str, &[&str])], idx: usize) -> Option<PathBuf> {
+    let mut fs = String::new();
+    for (label, exts) in filters {
+        let pat: Vec<String> = exts.iter().map(|e| format!("*.{e}")).collect();
+        fs += &format!("{label}\0{}\0", pat.join(";"));
+    }
+    fs.push('\0');
+    let filter: Vec<u16> = fs.encode_utf16().collect();
     let mut buf = vec![0u16; 32768];
     for (i, c) in default_name.encode_utf16().take(32000).enumerate() {
         buf[i] = c;
     }
-    let defext = wide(if prefer_pdf || only_pdf { "pdf" } else { "jpg" });
+    let idx = idx.min(filters.len().saturating_sub(1));
+    let defext = wide(filters.get(idx).and_then(|f| f.1.first()).copied().unwrap_or(""));
     let dir = initial_dir.map(wpath);
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: hwnd,
         lpstrFilter: PCWSTR(filter.as_ptr()),
-        nFilterIndex: if only_pdf { 1 } else if prefer_pdf { 5 } else { 1 },
+        nFilterIndex: idx as u32 + 1,
         lpstrFile: PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
         lpstrDefExt: PCWSTR(defext.as_ptr()),
@@ -133,13 +131,38 @@ pub fn save_dialog(hwnd: HWND, default_name: &str, initial_dir: Option<&Path>, p
         return None;
     }
     let mut p = PathBuf::from(from_wide(&buf));
-    let known = ["jpg", "jpeg", "png", "bmp", "tif", "tiff", "pdf"];
-    if !known.contains(&crate::util::ext_lower(&p).as_str()) {
-        let e = if only_pdf { "pdf" } else { SAVE_EXTS[(ofn.nFilterIndex.max(1) as usize - 1).min(4)] };
-        let name = format!("{}.{e}", crate::util::file_name(&p));
-        p.set_file_name(name);
+    let chosen = filters.get((ofn.nFilterIndex.max(1) - 1) as usize).copied().unwrap_or(filters[0]);
+    let e = crate::util::ext_lower(&p);
+    let known = filters.iter().any(|f| f.1.contains(&e.as_str()));
+    if !known {
+        if let Some(first) = chosen.1.first() {
+            let name = format!("{}.{first}", crate::util::file_name(&p));
+            p.set_file_name(name);
+        }
     }
     Some(p)
+}
+
+/// Форматы фото + PDF для «Сохранить как».
+pub const PHOTO_FILTERS: &[(&str, &[&str])] = &[
+    ("JPEG", &["jpg", "jpeg"]),
+    ("PNG", &["png"]),
+    ("BMP", &["bmp"]),
+    ("TIFF", &["tif", "tiff"]),
+    ("GIF", &["gif"]),
+    ("JPEG XR", &["jxr"]),
+    ("HEIC (нужно расширение HEIF)", &["heic"]),
+    ("Иконка ICO", &["ico"]),
+    ("PDF", &["pdf"]),
+];
+
+/// Диалог «Сохранить как» для фото/документа. prefer_pdf — выбрать PDF по умолчанию; only_pdf — только PDF.
+pub fn save_dialog(hwnd: HWND, default_name: &str, initial_dir: Option<&Path>, prefer_pdf: bool, only_pdf: bool) -> Option<PathBuf> {
+    if only_pdf {
+        return save_as(hwnd, default_name, initial_dir, &[("PDF", &["pdf"])], 0);
+    }
+    let idx = if prefer_pdf { PHOTO_FILTERS.len() - 1 } else { 0 };
+    save_as(hwnd, default_name, initial_dir, PHOTO_FILTERS, idx)
 }
 
 #[cfg(test)]
@@ -151,5 +174,28 @@ mod tests {
         assert_eq!(parse_multi(&b), vec![PathBuf::from("C:\\d").join("a.jpg"), PathBuf::from("C:\\d").join("b.pdf")]);
         let b: Vec<u16> = "C:\\d\\a.jpg\0\0".encode_utf16().collect();
         assert_eq!(parse_multi(&b), vec![PathBuf::from("C:\\d\\a.jpg")]);
+    }
+}
+
+/// Выбор папки (системный диалог).
+pub fn pick_folder(hwnd: HWND, initial: Option<&Path>) -> Option<PathBuf> {
+    use windows::Win32::System::Com::*;
+    use windows::Win32::UI::Shell::*;
+    unsafe {
+        let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let o = d.GetOptions().ok()?;
+        d.SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        if let Some(p) = initial {
+            let w = wpath(p);
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(w.as_ptr()), None) {
+                let _ = d.SetFolder(&item);
+            }
+        }
+        d.Show(hwnd).ok()?;
+        let item = d.GetResult().ok()?;
+        let s = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = s.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(s.0 as *const _));
+        Some(PathBuf::from(path))
     }
 }

@@ -59,6 +59,13 @@ const ID_S_NEXT: u32 = 81;
 const ID_PDF: u32 = 90;
 const ID_PRINT: u32 = 91;
 const ID_CANCEL: u32 = 92;
+const ID_O_ROTL: u32 = 100;
+const ID_O_ROTR: u32 = 101;
+const ID_O_SMALL: u32 = 102;
+const ID_O_BIG: u32 = 103;
+const ID_O_CENTER: u32 = 104;
+const ID_O_RESET: u32 = 105;
+const ID_O_RESET_ALL: u32 = 106;
 const MENU_BASE: u32 = 1000;
 
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -92,6 +99,160 @@ struct Caps {
 }
 
 type MmRect = (f64, f64, f64, f64);
+
+/// Ручная поправка одного фото на листе поверх шаблона: сдвиг (мм),
+/// масштаб и поворот (градусы по часовой) вокруг центра.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Adj {
+    dx: f64,
+    dy: f64,
+    scale: f64,
+    angle: f64,
+}
+
+impl Default for Adj {
+    fn default() -> Adj {
+        Adj { dx: 0.0, dy: 0.0, scale: 1.0, angle: 0.0 }
+    }
+}
+
+/// Фото на листе: центр, размер (до поворота) и угол, всё в мм.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Geom {
+    cx: f64,
+    cy: f64,
+    w: f64,
+    h: f64,
+    angle: f64,
+}
+
+fn geom(r: MmRect, a: &Adj) -> Geom {
+    Geom { cx: r.0 + r.2 / 2.0 + a.dx, cy: r.1 + r.3 / 2.0 + a.dy, w: r.2 * a.scale, h: r.3 * a.scale, angle: a.angle }
+}
+
+impl Geom {
+    /// Точка листа (мм) → координаты фото относительно центра, без поворота.
+    fn local(&self, x: f64, y: f64) -> (f64, f64) {
+        let a = (-self.angle).to_radians();
+        let (dx, dy) = (x - self.cx, y - self.cy);
+        (dx * a.cos() - dy * a.sin(), dx * a.sin() + dy * a.cos())
+    }
+    /// Точка фото (относительно центра) → лист (мм).
+    fn world(&self, u: f64, v: f64) -> (f64, f64) {
+        let a = self.angle.to_radians();
+        (self.cx + u * a.cos() - v * a.sin(), self.cy + u * a.sin() + v * a.cos())
+    }
+    fn contains(&self, x: f64, y: f64) -> bool {
+        let (u, v) = self.local(x, y);
+        u.abs() <= self.w / 2.0 && v.abs() <= self.h / 2.0
+    }
+    fn corners(&self) -> [(f64, f64); 4] {
+        let (w, h) = (self.w / 2.0, self.h / 2.0);
+        [self.world(-w, -h), self.world(w, -h), self.world(w, h), self.world(-w, h)]
+    }
+}
+
+/// Нарисовать картинку с центром (cx, cy), размером w×h (до поворота) и углом — в точках устройства.
+/// Повороты на 90° делаются без потерь, остаток — преобразованием GDI.
+fn draw_obj(dc: HDC, im: &Img, cx: f64, cy: f64, w: f64, h: f64, angle: f64, hq: bool) {
+    let qf = (angle / 90.0).round();
+    let q = (qf as i64).rem_euclid(4) as u8;
+    let rest = angle - qf * 90.0;
+    let rotated;
+    let im = if q != 0 {
+        rotated = doc::rot_q(im.clone(), q);
+        &rotated
+    } else {
+        im
+    };
+    let (w, h) = if q % 2 == 1 { (h, w) } else { (w, h) };
+    unsafe {
+        let info = crate::util::bmi(im);
+        SetStretchBltMode(dc, if hq { HALFTONE } else { COLORONCOLOR });
+        let _ = SetBrushOrgEx(dc, 0, 0, None);
+        debug_assert!(rest.abs() < 0.01, "наклон — через compose()");
+        StretchDIBits(dc, (cx - w / 2.0).round() as i32, (cy - h / 2.0).round() as i32, w.round().max(1.0) as i32, h.round().max(1.0) as i32,
+            0, 0, im.w as i32, im.h as i32, Some(im.px.as_ptr() as *const _), &info, DIB_RGB_COLORS, SRCCOPY);
+    }
+}
+
+/// Есть ли наклон не на прямой угол (тогда лист собирается своим кодом).
+fn tilted(angle: f64) -> bool {
+    (angle - (angle / 90.0).round() * 90.0).abs() >= 0.01
+}
+
+/// Собрать лист картинкой: белая бумага size (точки), k — точек на мм,
+/// фото кладутся с поворотом на любой угол (билинейная выборка).
+/// Свой код вместо поворота средствами GDI: так одинаково и на экране, и на
+/// любом принтере (не все драйверы умеют повёрнутые картинки).
+fn compose(size: (u32, u32), k: (f64, f64), objs: &[(&Img, Geom)]) -> Img {
+    let mut dst = Img::filled(size.0.max(1), size.1.max(1), [255, 255, 255]);
+    for (src, g) in objs {
+        let (w, h) = (g.w * k.0, g.h * k.1);
+        if w < 1.0 || h < 1.0 {
+            continue;
+        }
+        // заранее уменьшить исходник до нужного размера (качественно, WIC)
+        let small;
+        let src: &Img = if (src.w as f64) > w * 1.5 {
+            small = codec::resize(src, w.round().max(1.0) as u32, h.round().max(1.0) as u32).unwrap_or_else(|_| (*src).clone());
+            &small
+        } else {
+            src
+        };
+        let (cx, cy) = (g.cx * k.0, g.cy * k.1);
+        let a = g.angle.to_radians();
+        let (ca, sa) = (a.cos(), a.sin());
+        // габарит повёрнутого прямоугольника
+        let ex = (w / 2.0 * ca).abs() + (h / 2.0 * sa).abs();
+        let ey = (w / 2.0 * sa).abs() + (h / 2.0 * ca).abs();
+        let x0 = (cx - ex).floor().max(0.0) as i64;
+        let x1 = (cx + ex).ceil().min(dst.w as f64) as i64;
+        let y0 = (cy - ey).floor().max(0.0) as i64;
+        let y1 = (cy + ey).ceil().min(dst.h as f64) as i64;
+        let (sw, sh) = (src.w as f64, src.h as f64);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (dx, dy) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
+                // в систему фото (поворот назад)
+                let u = dx * ca + dy * sa;
+                let v = -dx * sa + dy * ca;
+                if u.abs() > w / 2.0 || v.abs() > h / 2.0 {
+                    continue;
+                }
+                let fx = ((u + w / 2.0) / w * sw - 0.5).clamp(0.0, sw - 1.0);
+                let fy = ((v + h / 2.0) / h * sh - 0.5).clamp(0.0, sh - 1.0);
+                let (ix, iy) = (fx as usize, fy as usize);
+                let (ix2, iy2) = ((ix + 1).min(src.w as usize - 1), (iy + 1).min(src.h as usize - 1));
+                let (tx, ty) = (fx - ix as f64, fy - iy as f64);
+                let o = (y as usize * dst.w as usize + x as usize) * 4;
+                for c in 0..3 {
+                    let p = |xx: usize, yy: usize| src.px[(yy * src.w as usize + xx) * 4 + c] as f64;
+                    let top = p(ix, iy) * (1.0 - tx) + p(ix2, iy) * tx;
+                    let bot = p(ix, iy2) * (1.0 - tx) + p(ix2, iy2) * tx;
+                    dst.px[o + c] = (top * (1.0 - ty) + bot * ty).round() as u8;
+                }
+            }
+        }
+    }
+    dst
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DragKind {
+    Move,
+    Scale,
+    Rotate,
+}
+
+#[derive(Clone, Copy)]
+struct Drag {
+    kind: DragKind,
+    slot: usize,
+    from: (f64, f64),
+    start: Adj,
+    g: Geom,
+}
 
 /// Буфер DEVMODE с выравниванием (Vec<u64>).
 #[derive(Clone)]
@@ -127,6 +288,13 @@ struct PrintDlg {
     prev: RECT,
     pbtn: RECT,
     result: Option<String>,
+    /// Ручные поправки: (лист, место на листе) → сдвиг/масштаб/поворот.
+    adj: HashMap<(usize, usize), Adj>,
+    sel: Option<usize>,
+    drag: Option<Drag>,
+    hover: Option<DragKind>,
+    /// Предпросмотр: левый верхний угол листа на экране и точек на мм.
+    view: (f64, f64, f64),
 }
 
 // ------------------------------------------------------------ принтеры ---
@@ -245,7 +413,108 @@ fn fit_cell(img: &Img, cell: MmRect, fill: bool, autorot: bool) -> (Img, MmRect)
     }
 }
 
+/// Прямоугольник, который займёт фото с пропорцией aspect (ш/в) в ячейке — как в fit_cell.
+fn fit_rect(aspect: f64, cell: MmRect, fill: bool, autorot: bool) -> MmRect {
+    let cell_wide = cell.2 > cell.3;
+    let img_wide = aspect > 1.0;
+    let squareish = (aspect - 1.0).abs() < 0.05 || (cell.2 / cell.3 - 1.0).abs() < 0.05;
+    let a = if autorot && !squareish && cell_wide != img_wide { 1.0 / aspect } else { aspect };
+    if fill {
+        cell
+    } else {
+        let (w, h) = if cell.2 / cell.3 > a { (cell.3 * a, cell.3) } else { (cell.2, cell.2 / a) };
+        (cell.0 + (cell.2 - w) / 2.0, cell.1 + (cell.3 - h) / 2.0, w, h)
+    }
+}
+
+/// Угол в диапазон (−180; 180].
+fn norm_angle(a: f64) -> f64 {
+    let mut a = a % 360.0;
+    if a > 180.0 {
+        a -= 360.0;
+    }
+    if a <= -180.0 {
+        a += 360.0;
+    }
+    a
+}
+
 impl PrintDlg {
+    fn adj_of(&self, sheet: usize, slot: usize) -> Adj {
+        self.adj.get(&(sheet, slot)).copied().unwrap_or_default()
+    }
+
+    /// Места фото на текущем листе предпросмотра (мм): прямоугольник шаблона и итог с поправкой.
+    fn sheet_geoms(&mut self) -> Vec<(usize, Geom)> {
+        let sheets = self.sheets();
+        let Some(sheet) = sheets.get(self.sheet).cloned() else { return vec![] };
+        let land = self.sheet_land(&sheet);
+        let c = self.caps_view(land);
+        let cells = sheet_cells(c.phys, self.margin as f64, NUPS[self.nup]);
+        let mut v = vec![];
+        for (slot, (cell, &pi)) in cells.iter().zip(sheet.iter()).enumerate() {
+            let a = self.aspect_after(pi);
+            let r = fit_rect(a, *cell, self.fill, self.autorot);
+            v.push((slot, geom(r, &self.adj_of(self.sheet, slot))));
+        }
+        v
+    }
+
+    /// Пропорции фото, как их положит fit_cell (с правками печати).
+    fn aspect_after(&mut self, i: usize) -> f64 {
+        self.aspect(i)
+    }
+
+    fn to_mm(&self, x: i32, y: i32) -> (f64, f64) {
+        let (x0, y0, k) = self.view;
+        ((x as f64 - x0) / k.max(1e-6), (y as f64 - y0) / k.max(1e-6))
+    }
+
+    /// Что под мышью: (место, что тащить).
+    fn hit(&mut self, x: i32, y: i32) -> Option<(usize, DragKind, Geom)> {
+        let (mx, my) = self.to_mm(x, y);
+        let k = self.view.2.max(1e-6);
+        let geoms = self.sheet_geoms();
+        let near = 7.0 / k; // 7 точек экрана в мм
+        if let Some(sel) = self.sel {
+            if let Some((_, g)) = geoms.iter().find(|(s, _)| *s == sel) {
+                let (u, v) = g.local(mx, my);
+                let rot_v = -g.h / 2.0 - 24.0 / k;
+                if (u.powi(2) + (v - rot_v).powi(2)).sqrt() <= near * 1.3 {
+                    return Some((sel, DragKind::Rotate, *g));
+                }
+                if ((u.abs() - g.w / 2.0).abs() <= near) && ((v.abs() - g.h / 2.0).abs() <= near) {
+                    return Some((sel, DragKind::Scale, *g));
+                }
+            }
+        }
+        // сверху то, что нарисовано позже; выбранное — в приоритете
+        if let Some(sel) = self.sel {
+            if let Some((_, g)) = geoms.iter().find(|(s, g)| *s == sel && g.contains(mx, my)) {
+                return Some((sel, DragKind::Move, *g));
+            }
+        }
+        geoms.iter().rev().find(|(_, g)| g.contains(mx, my)).map(|(s, g)| (*s, DragKind::Move, *g))
+    }
+
+    fn set_adj(&mut self, slot: usize, a: Adj) {
+        if a == Adj::default() {
+            self.adj.remove(&(self.sheet, slot));
+        } else {
+            self.adj.insert((self.sheet, slot), a);
+        }
+    }
+
+    fn change_sel(&mut self, f: impl FnOnce(&mut Adj)) {
+        if let Some(s) = self.sel {
+            let mut a = self.adj_of(self.sheet, s);
+            f(&mut a);
+            a.scale = a.scale.clamp(0.1, 6.0);
+            a.angle = norm_angle(a.angle);
+            self.set_adj(s, a);
+        }
+    }
+
     fn printer(&self) -> Option<&str> {
         self.pi.and_then(|i| self.printers.get(i)).map(|s| s.as_str())
     }
@@ -308,6 +577,17 @@ impl PrintDlg {
         Some(dm)
     }
 
+    /// Размер бумаги без обращения к драйверу (для отрисовки): кеш или размер из списка.
+    fn caps_view(&self, land: bool) -> Caps {
+        self.caps.get(&land).copied().unwrap_or_else(|| {
+            let (w, h) = PAPERS[self.paper].2;
+            Caps { phys: if land { (h, w) } else { (w, h) }, off: (0.0, 0.0), dpi: (300.0, 300.0) }
+        })
+    }
+
+    /// Спросить у драйвера принтера геометрию листа. Только из обработчиков
+    /// событий — не из отрисовки: драйвер (особенно недоступного сетевого
+    /// принтера) может надолго задуматься и прокрутить очередь сообщений.
     fn caps(&mut self, land: bool) -> Caps {
         if let Some(c) = self.caps.get(&land) {
             return *c;
@@ -355,6 +635,8 @@ impl PrintDlg {
 
     fn reset_caps(&mut self) {
         self.caps.clear();
+        let _ = self.caps(false);
+        let _ = self.caps(true);
     }
 
     fn select_printer(&mut self, i: usize) {
@@ -439,19 +721,44 @@ impl PrintDlg {
                         }
                         let c = caps_of(dc);
                         let cells = sheet_cells(c.phys, self.margin as f64, NUPS[self.nup]);
-                        for (cell, &pi) in cells.iter().zip(sheet.iter()) {
-                            let img = self.full(pi, &mut cache)?;
-                            let (im, r) = fit_cell(&img, *cell, self.fill, self.autorot);
-                            let to_dev = |x: f64, off: f64, d: f64| ((x - off) / 25.4 * d).round() as i32;
-                            let (x0, y0) = (to_dev(r.0, c.off.0, c.dpi.0), to_dev(r.1, c.off.1, c.dpi.1));
-                            let (x1, y1) = (to_dev(r.0 + r.2, c.off.0, c.dpi.0), to_dev(r.1 + r.3, c.off.1, c.dpi.1));
-                            let (dw, dh) = ((x1 - x0).max(1), (y1 - y0).max(1));
-                            // не гоним в драйвер больше точек, чем нужно бумаге
-                            let im = if im.w as i32 > dw { codec::resize(&im, dw as u32, dh as u32).unwrap_or(im) } else { im };
-                            let info = crate::util::bmi(&im);
+                        let any_tilt = (0..sheet.len()).any(|slot| tilted(self.adj_of(s, slot).angle));
+                        if any_tilt {
+                            // лист целиком своей картинкой (до 300 точек на дюйм)
+                            let d = (c.dpi.0.min(300.0), c.dpi.1.min(300.0));
+                            let km = (d.0 / 25.4, d.1 / 25.4);
+                            let size = ((c.phys.0 * km.0).round() as u32, (c.phys.1 * km.1).round() as u32);
+                            let mut imgs = vec![];
+                            for (slot, (cell, &pi)) in cells.iter().zip(sheet.iter()).enumerate() {
+                                let img = self.full(pi, &mut cache)?;
+                                let (im, r) = fit_cell(&img, *cell, self.fill, self.autorot);
+                                imgs.push((im, geom(r, &self.adj_of(s, slot))));
+                            }
+                            let refs: Vec<(&Img, Geom)> = imgs.iter().map(|(i, g)| (i, *g)).collect();
+                            let page = compose(size, km, &refs);
+                            let info = crate::util::bmi(&page);
+                            let to_dev = |x: f64, off: f64, dd: f64| ((x - off) / 25.4 * dd).round() as i32;
+                            let (dx0, dy0) = (to_dev(0.0, c.off.0, c.dpi.0), to_dev(0.0, c.off.1, c.dpi.1));
+                            let (dw, dh) = ((c.phys.0 / 25.4 * c.dpi.0).round() as i32, (c.phys.1 / 25.4 * c.dpi.1).round() as i32);
                             SetStretchBltMode(dc, HALFTONE);
                             let _ = SetBrushOrgEx(dc, 0, 0, None);
-                            StretchDIBits(dc, x0, y0, dw, dh, 0, 0, im.w as i32, im.h as i32, Some(im.px.as_ptr() as *const _), &info, DIB_RGB_COLORS, SRCCOPY);
+                            StretchDIBits(dc, dx0, dy0, dw, dh, 0, 0, page.w as i32, page.h as i32, Some(page.px.as_ptr() as *const _), &info, DIB_RGB_COLORS, SRCCOPY);
+                            EndPage(dc);
+                            continue;
+                        }
+                        for (slot, (cell, &pi)) in cells.iter().zip(sheet.iter()).enumerate() {
+                            let img = self.full(pi, &mut cache)?;
+                            let (im, r) = fit_cell(&img, *cell, self.fill, self.autorot);
+                            let g = geom(r, &self.adj_of(s, slot));
+                            let cx = (g.cx - c.off.0) / 25.4 * c.dpi.0;
+                            let cy = (g.cy - c.off.1) / 25.4 * c.dpi.1;
+                            let (dw, dh) = (g.w / 25.4 * c.dpi.0, g.h / 25.4 * c.dpi.1);
+                            // не гоним в драйвер больше точек, чем нужно бумаге
+                            let im = if im.w as f64 > dw * 1.05 {
+                                codec::resize(&im, dw.round().max(1.0) as u32, dh.round().max(1.0) as u32).unwrap_or(im)
+                            } else {
+                                im
+                            };
+                            draw_obj(dc, &im, cx, cy, dw, dh, g.angle, true);
                         }
                         EndPage(dc);
                     }
@@ -472,20 +779,21 @@ impl PrintDlg {
         let sheets = self.sheets();
         let mut out = vec![];
         let mut cache = HashMap::new();
-        for sheet in &sheets {
+        for (si, sheet) in sheets.iter().enumerate() {
             let land = self.sheet_land(sheet);
             let c = self.caps(land);
             let cells = sheet_cells(c.phys, self.margin as f64, NUPS[self.nup]);
             let mut items = vec![];
-            for (cell, &pi) in cells.iter().zip(sheet.iter()) {
+            for (slot, (cell, &pi)) in cells.iter().zip(sheet.iter()).enumerate() {
                 let img = self.full(pi, &mut cache)?;
                 let (im, r) = fit_cell(&img, *cell, self.fill, self.autorot);
+                let g = geom(r, &self.adj_of(si, slot));
                 // 300 точек на дюйм достаточно для печати
-                let (tw, th) = ((r.2 / 25.4 * 300.0).round() as u32, (r.3 / 25.4 * 300.0).round() as u32);
+                let (tw, th) = ((g.w / 25.4 * 300.0).round() as u32, (g.h / 25.4 * 300.0).round() as u32);
                 let im = if im.w > tw.max(1) { codec::resize(&im, tw.max(1), th.max(1)).unwrap_or(im) } else { im };
                 let jpeg = codec::encode_jpeg(&im).map_err(|e| e.message().to_string())?;
-                let place = (r.0 * MM, (c.phys.1 - r.1 - r.3) * MM, r.2 * MM, r.3 * MM);
-                items.push(Placed { jpeg, px: (im.w, im.h), place });
+                let place = ((g.cx - g.w / 2.0) * MM, (c.phys.1 - g.cy - g.h / 2.0) * MM, g.w * MM, g.h * MM);
+                items.push(Placed { jpeg, px: (im.w, im.h), place, angle: g.angle });
             }
             out.push(OutPage::Raster { page: (c.phys.0 * MM, c.phys.1 * MM), items });
         }
@@ -588,14 +896,50 @@ impl Panel for PrintDlg {
         v.push(W::new(Kind::Label, 0, gui::r(x, y, pw, ui.s(22))).t(desc).color(ui.t.dim));
 
         // предпросмотр и листание
-        self.prev = gui::r(m, m, x - 2 * m, h - m - ui.s(64) - m);
+        self.prev = gui::r(m, m, x - 2 * m, h - m - ui.s(96) - m);
         let n = self.sheets().len();
         self.sheet = self.sheet.min(n.saturating_sub(1));
         let ny = self.prev.bottom + ui.s(8);
-        let cx = (self.prev.left + self.prev.right) / 2;
-        v.push(W::new(Kind::Tool, ID_S_PREV, gui::r(cx - ui.s(110), ny, tb, tb)).i(gui::IC_PREV).en(self.sheet > 0).tip("Предыдущий лист"));
-        v.push(W::new(Kind::Label, 0, gui::r(cx - ui.s(72), ny, ui.s(144), tb)).t(format!("Лист {} из {}", self.sheet + 1, n.max(1))).align(1));
-        v.push(W::new(Kind::Tool, ID_S_NEXT, gui::r(cx + ui.s(76), ny, tb, tb)).i(gui::IC_NEXT).en(self.sheet + 1 < n).tip("Следующий лист"));
+        // листы — слева в ряду кнопок
+        let sy = h - m - ui.s(36) + (ui.s(36) - tb) / 2;
+        v.push(W::new(Kind::Tool, ID_S_PREV, gui::r(m, sy, tb, tb)).i(gui::IC_PREV).en(self.sheet > 0).tip("Предыдущий лист"));
+        v.push(W::new(Kind::Label, 0, gui::r(m + tb, sy, ui.s(112), tb)).t(format!("Лист {} из {}", self.sheet + 1, n.max(1))).align(1));
+        v.push(W::new(Kind::Tool, ID_S_NEXT, gui::r(m + tb + ui.s(112), sy, tb, tb)).i(gui::IC_NEXT).en(self.sheet + 1 < n).tip("Следующий лист"));
+        // выбранное фото — под предпросмотром
+        let lx = self.prev.left;
+        let avail = self.prev.right - lx;
+        if let Some(sel) = self.sel {
+            let a = self.adj_of(self.sheet, sel);
+            let tools = [
+                (ID_O_ROTL, gui::IC_ROT_L, "Повернуть фото на 90° влево"),
+                (ID_O_ROTR, gui::IC_ROT_R, "Повернуть фото на 90° вправо"),
+                (ID_O_SMALL, gui::IC_ZOOM_OUT, "Меньше (−, Ctrl+колесо)"),
+                (ID_O_BIG, gui::IC_ZOOM_IN, "Больше (+, Ctrl+колесо)"),
+                (ID_O_CENTER, gui::IC_FIT, "Вернуть на место (по центру ячейки)"),
+                (ID_O_RESET, gui::IC_RESET, "Сбросить поворот, размер и место (Delete, двойной щелчок)"),
+            ];
+            let mut x = lx;
+            for (id, ic, tip) in tools {
+                v.push(W::new(Kind::Tool, id, gui::r(x, ny, tb, tb)).i(ic).tip(tip));
+                x += tb + ui.s(2);
+            }
+            let d = format!("{:+.0}°  ·  {:.0}%", a.angle, a.scale * 100.0);
+            if avail - (x - lx) > ui.s(90) {
+                v.push(W::new(Kind::Label, 0, gui::r(x + ui.s(8), ny, avail - (x - lx) - ui.s(8), tb)).t(d).color(ui.t.dim));
+            }
+        } else if avail > ui.s(200) {
+            let hint = if self.adj.is_empty() {
+                "Щёлкните фото на листе: тянуть — двигать, уголки — размер, кружок — повернуть"
+            } else {
+                "Щёлкните фото, чтобы поправить его"
+            };
+            let mut x = lx;
+            if !self.adj.is_empty() {
+                v.push(W::new(Kind::Tool, ID_O_RESET_ALL, gui::r(x, ny, tb, tb)).i(gui::IC_RESET).tip("Сбросить ручные поправки всех фото"));
+                x += tb + ui.s(8);
+            }
+            v.push(W::new(Kind::Label, 0, gui::r(x, ny, avail - (x - lx), tb)).t(hint).color(ui.t.dim));
+        }
 
         // кнопки
         let by = h - m - ui.s(36);
@@ -623,7 +967,7 @@ impl Panel for PrintDlg {
         let sheets = self.sheets();
         let Some(sheet) = sheets.get(self.sheet).cloned() else { return };
         let land = self.sheet_land(&sheet);
-        let c = self.caps(land);
+        let c = self.caps_view(land);
         let pad = ui.s(24) as f64;
         let k = ((pr.right - pr.left) as f64 - 2.0 * pad).max(10.0) / c.phys.0;
         let k = k.min(((pr.bottom - pr.top) as f64 - 2.0 * pad).max(10.0) / c.phys.1);
@@ -643,14 +987,57 @@ impl Panel for PrintDlg {
         if m > 0.0 {
             gui::frame(hdc, &to((m, m, c.phys.0 - 2.0 * m, c.phys.1 - 2.0 * m)), rgb(200, 200, 200), PS_DOT);
         }
+        self.view = (x0 as f64, y0 as f64, k);
         let cells = sheet_cells(c.phys, self.margin as f64, NUPS[self.nup]);
-        for (cell, &pi) in cells.iter().zip(sheet.iter()) {
+        let mut geoms = vec![];
+        let mut objs: Vec<(Img, Geom)> = vec![];
+        for (slot, (cell, &pi)) in cells.iter().zip(sheet.iter()).enumerate() {
             let Some(img) = self.prepped(pi) else {
                 gui::text(hdc, "нет изображения", &to(*cell), ui.f.small, rgb(150, 150, 150), gui::CENTER);
                 continue;
             };
             let (im, r) = fit_cell(&img, *cell, self.fill, self.autorot);
-            gui::blit(hdc, &im, &to(r), true);
+            let g = geom(r, &self.adj_of(self.sheet, slot));
+            geoms.push((slot, g));
+            objs.push((im, g));
+        }
+        if objs.iter().any(|(_, g)| tilted(g.angle)) {
+            let refs: Vec<(&Img, Geom)> = objs.iter().map(|(i, g)| (i, *g)).collect();
+            let sheet_img = compose((pw.max(1) as u32, ph.max(1) as u32), (k, k), &refs);
+            gui::blit(hdc, &sheet_img, &gui::r(x0, y0, pw, ph), false);
+            if m > 0.0 {
+                gui::frame(hdc, &to((m, m, c.phys.0 - 2.0 * m, c.phys.1 - 2.0 * m)), rgb(200, 200, 200), PS_DOT);
+            }
+        } else {
+            unsafe {
+                let saved = SaveDC(hdc);
+                let _ = IntersectClipRect(hdc, x0, y0, x0 + pw, y0 + ph);
+                let hq = self.drag.is_none();
+                for (im, g) in &objs {
+                    draw_obj(hdc, im, x0 as f64 + g.cx * k, y0 as f64 + g.cy * k, g.w * k, g.h * k, g.angle, hq);
+                }
+                let _ = RestoreDC(hdc, saved);
+            }
+        }
+        // выбранное фото: рамка, уголки (размер) и кружок (поворот)
+        if let Some((_, g)) = geoms.iter().find(|(s, _)| Some(*s) == self.sel) {
+            let p = |(x, y): (f64, f64)| ((x0 as f64 + x * k).round() as i32, (y0 as f64 + y * k).round() as i32);
+            let cs = g.corners();
+            for i in 0..4 {
+                let (a, b) = (p(cs[i]), p(cs[(i + 1) % 4]));
+                gui::line(hdc, a.0, a.1, b.0, b.1, t.accent, 2, PS_SOLID);
+            }
+            let hs = ui.s(5);
+            for c in cs {
+                let (x, y) = p(c);
+                gui::fill(hdc, &gui::r(x - hs, y - hs, 2 * hs, 2 * hs), rgb(255, 255, 255));
+                gui::frame(hdc, &gui::r(x - hs, y - hs, 2 * hs, 2 * hs), t.accent, PS_SOLID);
+            }
+            let top = p(g.world(0.0, -g.h / 2.0));
+            let knob = p(g.world(0.0, -g.h / 2.0 - ui.s(24) as f64 / k));
+            gui::line(hdc, top.0, top.1, knob.0, knob.1, t.accent, 1, PS_SOLID);
+            let rr = ui.s(7);
+            gui::round(hdc, &gui::r(knob.0 - rr, knob.1 - rr, 2 * rr, 2 * rr), 2 * rr, Some(rgb(255, 255, 255)), Some(t.accent));
         }
         // непечатаемая зона принтера — тонкая рамка
         if c.off.0 > 0.0 || c.off.1 > 0.0 {
@@ -659,14 +1046,108 @@ impl Panel for PrintDlg {
         }
     }
 
+    fn cursor(&self, x: i32, y: i32) -> Option<PCWSTR> {
+        if !gui::inside(&self.prev, x, y) {
+            return None;
+        }
+        if let Some(d) = self.drag {
+            return Some(match d.kind {
+                DragKind::Move => IDC_SIZEALL,
+                DragKind::Scale => IDC_SIZENWSE,
+                DragKind::Rotate => IDC_HAND,
+            });
+        }
+        self.hover.map(|k| match k {
+            DragKind::Move => IDC_SIZEALL,
+            DragKind::Scale => IDC_SIZENWSE,
+            DragKind::Rotate => IDC_HAND,
+        })
+    }
+
     fn mouse(&mut self, _hwnd: HWND, m: Mouse, x: i32, y: i32) -> bool {
+        let shift = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) } < 0;
+        let ctrl = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0;
+        match m {
+            Mouse::Down if gui::inside(&self.prev, x, y) => {
+                match self.hit(x, y) {
+                    Some((slot, kind, g)) => {
+                        self.sel = Some(slot);
+                        let start = self.adj_of(self.sheet, slot);
+                        self.drag = Some(Drag { kind, slot, from: self.to_mm(x, y), start, g });
+                    }
+                    None => self.sel = None,
+                }
+                return true;
+            }
+            Mouse::Move => {
+                let Some(d) = self.drag else {
+                    let h = if gui::inside(&self.prev, x, y) { self.hit(x, y).map(|h| h.1) } else { None };
+                    self.hover = h;
+                    return false;
+                };
+                let (mx, my) = self.to_mm(x, y);
+                let mut a = d.start;
+                match d.kind {
+                    DragKind::Move => {
+                        a.dx = d.start.dx + mx - d.from.0;
+                        a.dy = d.start.dy + my - d.from.1;
+                        // Shift — только по горизонтали или вертикали
+                        if shift {
+                            if (mx - d.from.0).abs() > (my - d.from.1).abs() {
+                                a.dy = d.start.dy;
+                            } else {
+                                a.dx = d.start.dx;
+                            }
+                        }
+                    }
+                    DragKind::Scale => {
+                        let d0 = ((d.from.0 - d.g.cx).powi(2) + (d.from.1 - d.g.cy).powi(2)).sqrt().max(0.1);
+                        let d1 = ((mx - d.g.cx).powi(2) + (my - d.g.cy).powi(2)).sqrt();
+                        a.scale = (d.start.scale * d1 / d0).clamp(0.1, 6.0);
+                    }
+                    DragKind::Rotate => {
+                        // угол от центра до мыши; «вверх» = 0°
+                        let ang = (mx - d.g.cx).atan2(-(my - d.g.cy)).to_degrees();
+                        let mut v = ang;
+                        if shift {
+                            v = (v / 15.0).round() * 15.0;
+                        } else if ((v / 90.0).round() * 90.0 - v).abs() < 3.0 {
+                            v = (v / 90.0).round() * 90.0; // прилипает к прямым углам
+                        }
+                        a.angle = norm_angle(v);
+                    }
+                }
+                self.set_adj(d.slot, a);
+                return true;
+            }
+            Mouse::Up => {
+                if self.drag.take().is_some() {
+                    return true;
+                }
+            }
+            Mouse::Dbl if gui::inside(&self.prev, x, y) => {
+                if let Some((slot, _, _)) = self.hit(x, y) {
+                    self.sel = Some(slot);
+                    self.set_adj(slot, Adj::default());
+                    return true;
+                }
+            }
+            Mouse::Wheel(d) if ctrl && self.sel.is_some() && gui::inside(&self.prev, x, y) => {
+                let k = if d > 0 { 1.05 } else { 1.0 / 1.05 };
+                self.change_sel(|a| a.scale *= k);
+                return true;
+            }
+            _ => {}
+        }
         if let Mouse::Wheel(d) = m {
             if gui::inside(&self.prev, x, y) {
                 let n = self.sheets().len();
                 if d < 0 && self.sheet + 1 < n {
                     self.sheet += 1;
+                    self.sel = None;
                 } else if d > 0 && self.sheet > 0 {
                     self.sheet -= 1;
+                    self.sel = None;
                 }
                 return true;
             }
@@ -700,6 +1181,8 @@ impl Panel for PrintDlg {
             i if (ID_NUP0..ID_NUP0 + NUPS.len() as u32).contains(&i) => {
                 self.nup = (i - ID_NUP0) as usize;
                 self.sheet = 0;
+                self.adj.clear();
+                self.sel = None;
             }
             ID_FIT => self.fill = false,
             ID_FILL => self.fill = true,
@@ -711,10 +1194,26 @@ impl Panel for PrintDlg {
             ID_ALL => {
                 self.all = true;
                 self.sheet = 0;
+                self.adj.clear();
+                self.sel = None;
             }
             ID_CUR => {
                 self.all = false;
                 self.sheet = 0;
+                self.adj.clear();
+                self.sel = None;
+            }
+            ID_O_ROTL => self.change_sel(|a| a.angle = ((a.angle / 90.0).round() - 1.0) * 90.0),
+            ID_O_ROTR => self.change_sel(|a| a.angle = ((a.angle / 90.0).round() + 1.0) * 90.0),
+            ID_O_SMALL => self.change_sel(|a| a.scale /= 1.1),
+            ID_O_BIG => self.change_sel(|a| a.scale *= 1.1),
+            ID_O_CENTER => self.change_sel(|a| {
+                a.dx = 0.0;
+                a.dy = 0.0;
+            }),
+            ID_O_RESET => self.change_sel(|a| *a = Adj::default()),
+            ID_O_RESET_ALL => {
+                self.adj.clear();
             }
             ID_E_ROTL => self.ed.rot = (self.ed.rot + 3) % 4,
             ID_E_ROTR => self.ed.rot = (self.ed.rot + 1) % 4,
@@ -728,8 +1227,14 @@ impl Panel for PrintDlg {
                 self.reset_caps();
             }
             ID_E_RESET => self.ed = Edits::default(),
-            ID_S_PREV => self.sheet = self.sheet.saturating_sub(1),
-            ID_S_NEXT => self.sheet += 1,
+            ID_S_PREV => {
+                self.sheet = self.sheet.saturating_sub(1);
+                self.sel = None;
+            }
+            ID_S_NEXT => {
+                self.sheet += 1;
+                self.sel = None;
+            }
             ID_PDF => {
                 self.save_settings();
                 let stem = self.name.clone();
@@ -775,7 +1280,30 @@ impl Panel for PrintDlg {
         true
     }
 
-    fn key(&mut self, hwnd: HWND, vk: u16, _ctrl: bool, _shift: bool) -> Option<bool> {
+    fn key(&mut self, hwnd: HWND, vk: u16, _ctrl: bool, shift: bool) -> Option<bool> {
+        if self.sel.is_some() {
+            let st = if shift { 5.0 } else { 1.0 };
+            match vk {
+                0x25 => self.change_sel(|a| a.dx -= st),
+                0x27 => self.change_sel(|a| a.dx += st),
+                0x26 => self.change_sel(|a| a.dy -= st),
+                0x28 => self.change_sel(|a| a.dy += st),
+                0xBB | 0x6B => self.change_sel(|a| a.scale *= 1.05),
+                0xBD | 0x6D => self.change_sel(|a| a.scale /= 1.05),
+                0xDB => self.change_sel(|a| a.angle -= if shift { 15.0 } else { 1.0 }), // [
+                0xDD => self.change_sel(|a| a.angle += if shift { 15.0 } else { 1.0 }), // ]
+                0x2E | 0x08 => self.change_sel(|a| *a = Adj::default()),
+                0x1B => self.sel = None,
+                _ => return self.key_sheet(hwnd, vk),
+            }
+            return Some(true);
+        }
+        self.key_sheet(hwnd, vk)
+    }
+}
+
+impl PrintDlg {
+    fn key_sheet(&mut self, hwnd: HWND, vk: u16) -> Option<bool> {
         match vk {
             0x21 | 0x25 => Some(self.event(hwnd, Ev::Click(ID_S_PREV))),
             0x22 | 0x27 => {
@@ -819,10 +1347,16 @@ pub fn run(owner: HWND, pages: Vec<Page>, cur: usize, view: Option<Rc<Img>>, nam
         prev: RECT::default(),
         pbtn: RECT::default(),
         result: None,
+        adj: HashMap::new(),
+        sel: None,
+        drag: None,
+        hover: None,
+        view: (0.0, 0.0, 1.0),
     };
     if let Some(v) = view {
         d.thumbs.insert(d.cur, Rc::new(codec::thumb(&v, 1000)));
     }
+    d.reset_caps();
     // начнём предпросмотр с листа, где текущая страница
     d.sheet = d.cur / NUPS[d.nup];
     gui::run_modal(owner, d, (1080, 760)).result
@@ -831,6 +1365,36 @@ pub fn run(owner: HWND, pages: Vec<Page>, cur: usize, view: Option<Rc<Img>>, nam
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_geometry() {
+        let g = geom((10.0, 20.0, 40.0, 20.0), &Adj { dx: 5.0, dy: 0.0, scale: 2.0, angle: 90.0 });
+        assert_eq!((g.cx, g.cy, g.w, g.h), (35.0, 30.0, 80.0, 40.0));
+        // повёрнутое на 90° фото 80×40 занимает по вертикали ±40 мм от центра
+        assert!(g.contains(35.0, 30.0 + 39.0));
+        assert!(!g.contains(35.0 + 39.0, 30.0));
+        let (x, y) = g.world(40.0, 0.0);
+        assert!((x - 35.0).abs() < 1e-9 && (y - 70.0).abs() < 1e-9);
+        assert_eq!(norm_angle(270.0), -90.0);
+        assert_eq!(norm_angle(-180.0), 180.0);
+        let r = fit_rect(2.0, (0.0, 0.0, 100.0, 100.0), false, false);
+        assert_eq!(r, (0.0, 25.0, 100.0, 50.0));
+        let img = Img::filled(400, 200, [0, 0, 0]);
+        assert_eq!(fit_cell(&img, (0.0, 0.0, 100.0, 100.0), false, false).1, r);
+    }
+
+    #[test]
+    fn compose_rotated() {
+        let black = Img::filled(40, 20, [0, 0, 0]);
+        let g = Geom { cx: 50.0, cy: 50.0, w: 40.0, h: 10.0, angle: 90.0 + 0.5 };
+        let sheet = compose((100, 100), (1.0, 1.0), &[(&black, g)]);
+        let px = |x: usize, y: usize| sheet.px[(y * 100 + x) * 4];
+        assert_eq!(px(50, 50), 0);
+        assert_eq!(px(50, 32), 0, "почти вертикальная полоса — сверху от центра закрашено");
+        assert_eq!(px(32, 50), 255, "а слева — нет");
+        assert_eq!(px(1, 1), 255);
+        assert!(tilted(30.0) && !tilted(-90.0) && !tilted(180.0));
+    }
 
     #[test]
     fn cells_layout() {

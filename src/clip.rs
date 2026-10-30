@@ -142,6 +142,32 @@ pub fn set_image(hwnd: HWND, img: &Img) -> bool {
     }
 }
 
+/// Положить текст в буфер.
+pub fn set_text(hwnd: HWND, text: &str) -> bool {
+    let w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let size = w.len() * 2;
+    unsafe {
+        let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, size) else { return false };
+        let p = GlobalLock(hg) as *mut u16;
+        if p.is_null() {
+            let _ = GlobalFree(hg);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+        let _ = GlobalUnlock(hg);
+        let Some(_g) = open(hwnd) else {
+            let _ = GlobalFree(hg);
+            return false;
+        };
+        let _ = EmptyClipboard();
+        if SetClipboardData(13, HANDLE(hg.0)).is_err() {
+            let _ = GlobalFree(hg);
+            return false;
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

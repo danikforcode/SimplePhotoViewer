@@ -24,6 +24,8 @@ pub struct Placed {
     pub jpeg: Vec<u8>,
     pub px: (u32, u32),
     pub place: (f64, f64, f64, f64),
+    /// Поворот вокруг центра, градусы по часовой (как видно на листе).
+    pub angle: f64,
 }
 
 /// Как класть фото на страницу PDF.
@@ -165,7 +167,18 @@ pub fn write(pages: &[OutPage], out: &Path) -> Result<(), String> {
                     let img_id = doc.add_object(img);
                     xobj.set(format!("Im{i}").into_bytes(), img_id);
                     let (x, y, w, h) = it.place;
-                    content += &format!("q {w:.3} 0 0 {h:.3} {x:.3} {y:.3} cm /Im{i} Do Q\n");
+                    if it.angle.abs() < 1e-6 {
+                        content += &format!("q {w:.3} 0 0 {h:.3} {x:.3} {y:.3} cm /Im{i} Do Q\n");
+                    } else {
+                        // в PDF ось y вверх: поворот «по часовой на листе» = −angle
+                        let a = (-it.angle).to_radians();
+                        let (c, sn) = (a.cos(), a.sin());
+                        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+                        content += &format!(
+                            "q 1 0 0 1 {cx:.3} {cy:.3} cm {c:.6} {sn:.6} {:.6} {c:.6} 0 0 cm {w:.3} 0 0 {h:.3} {:.3} {:.3} cm /Im{i} Do Q\n",
+                            -sn, -w / 2.0, -h / 2.0
+                        );
+                    }
                 }
                 let c_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
                 let p = dictionary! {
@@ -230,7 +243,7 @@ mod tests {
 
     fn raster(mode: PhotoPage) -> OutPage {
         let (page, place) = photo_layout((1, 1), mode, 10.0);
-        OutPage::Raster { page, items: vec![Placed { jpeg: JPEG_1X1.to_vec(), px: (1, 1), place }] }
+        OutPage::Raster { page, items: vec![Placed { jpeg: JPEG_1X1.to_vec(), px: (1, 1), place, angle: 0.0 }] }
     }
 
     #[test]
@@ -259,8 +272,8 @@ mod tests {
                 OutPage::Raster {
                     page: A4,
                     items: vec![
-                        Placed { jpeg: JPEG_1X1.to_vec(), px: (1, 1), place: (10.0, 10.0, 100.0, 100.0) },
-                        Placed { jpeg: JPEG_1X1.to_vec(), px: (1, 1), place: (200.0, 10.0, 100.0, 100.0) },
+                        Placed { jpeg: JPEG_1X1.to_vec(), px: (1, 1), place: (10.0, 10.0, 100.0, 100.0), angle: 0.0 },
+                        Placed { jpeg: JPEG_1X1.to_vec(), px: (1, 1), place: (200.0, 10.0, 100.0, 100.0), angle: 30.0 },
                     ],
                 },
             ],
