@@ -7,8 +7,9 @@
 use crate::gui::{self, Mouse, Ui};
 use crate::image_buf::Img;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -18,7 +19,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Сообщение главному окну о событии Media Engine.
 pub const WM_MEDIA: u32 = 0x8000 + 21; // WM_APP + 21
@@ -44,7 +46,6 @@ struct D3d {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     _mgr: IMFDXGIDeviceManager,
-    tex: Option<(ID3D11Texture2D, ID3D11Texture2D, u32, u32)>,
 }
 
 fn create_d3d() -> Option<(D3d, IMFDXGIDeviceManager)> {
@@ -72,7 +73,137 @@ fn create_d3d() -> Option<(D3d, IMFDXGIDeviceManager)> {
         MFCreateDXGIDeviceManager(&mut token, &mut mgr).ok()?;
         let mgr = mgr?;
         mgr.ResetDevice(&device, token).ok()?;
-        Some((D3d { device, ctx, _mgr: mgr.clone(), tex: None }, mgr))
+        Some((D3d { device, ctx, _mgr: mgr.clone() }, mgr))
+    }
+}
+
+// ------------------------------------------------- вывод видео (GPU) ---
+// Кадр идёт из Media Engine прямо в цепочку буферов DXGI окна-«экрана»:
+// без копии в память и без растягивания процессором. Отдельный поток
+// ждёт обновления монитора (VBlank) и показывает новый кадр — ровно,
+// без рывков таймера и без перерисовки всего окна программы.
+
+struct Shared {
+    stop: AtomicBool,
+    /// Размер окна-экрана (точки); меняется из окна программы.
+    size: Mutex<(u32, u32)>,
+    /// Показать кадр заново (сдвинули/изменили размер/пауза).
+    redraw: AtomicBool,
+}
+
+struct Agile<T>(T);
+unsafe impl<T> Send for Agile<T> {}
+
+struct VideoOut {
+    hwnd: HWND,
+    shared: Arc<Shared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    rect: RECT,
+}
+
+unsafe extern "system" fn video_wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        // мышь «проходит насквозь» — её обрабатывает окно программы
+        WM_NCHITTEST => LRESULT(-1), // HTTRANSPARENT
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let _ = BeginPaint(h, &mut ps);
+            let _ = EndPaint(h, &ps);
+            let p = GetWindowLongPtrW(h, GWLP_USERDATA) as *const Shared;
+            if !p.is_null() {
+                (*p).redraw.store(true, Ordering::Relaxed);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(h, msg, wp, lp),
+    }
+}
+
+fn video_class() -> PCWSTR {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let name = w!("SPV_Video");
+    ONCE.call_once(|| unsafe {
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(video_wndproc),
+            hInstance: windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default().into(),
+            lpszClassName: name,
+            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+    });
+    name
+}
+
+fn create_swap(d: &D3d, hwnd: HWND) -> Option<IDXGISwapChain1> {
+    unsafe {
+        let dxgi: IDXGIDevice = d.device.cast().ok()?;
+        let adapter = dxgi.GetAdapter().ok()?;
+        let factory: IDXGIFactory2 = adapter.GetParent().ok()?;
+        for (effect, count) in [(DXGI_SWAP_EFFECT_FLIP_DISCARD, 2), (DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 2), (DXGI_SWAP_EFFECT_DISCARD, 1)] {
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: 64,
+                Height: 64,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: count,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: effect,
+                AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                ..Default::default()
+            };
+            if let Ok(sc) = factory.CreateSwapChainForHwnd(&d.device, hwnd, &desc, None, None) {
+                let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                return Some(sc);
+            }
+        }
+        None
+    }
+}
+
+/// Поток показа кадров.
+fn render_loop(engine: IMFMediaEngine, swap: IDXGISwapChain1, sh: Arc<Shared>) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let output = swap.GetContainingOutput().ok();
+        let mut last = i64::MIN;
+        let mut cur = (64u32, 64u32);
+        let black = MFARGB { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbAlpha: 255 };
+        while !sh.stop.load(Ordering::Relaxed) {
+            let want = *sh.size.lock().unwrap();
+            let mut force = sh.redraw.swap(false, Ordering::Relaxed);
+            if want != cur && want.0 > 0 && want.1 > 0 {
+                if swap.ResizeBuffers(0, want.0, want.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+                    cur = want;
+                    force = true;
+                }
+            }
+            let fresh = matches!(engine.OnVideoStreamTick(), Ok(p) if p != last && { last = p; true });
+            if fresh || force {
+                let (mut vw, mut vh) = (0u32, 0u32);
+                let _ = engine.GetNativeVideoSize(Some(&mut vw), Some(&mut vh));
+                if vw > 0 && vh > 0 {
+                    if let Ok(bb) = swap.GetBuffer::<ID3D11Texture2D>(0) {
+                        // вписать с сохранением пропорций (поля — чёрные)
+                        let (cw, ch) = (cur.0 as f64, cur.1 as f64);
+                        let k = (cw / vw as f64).min(ch / vh as f64);
+                        let (w, h) = ((vw as f64 * k).round(), (vh as f64 * k).round());
+                        let dst = RECT { left: ((cw - w) / 2.0) as i32, top: ((ch - h) / 2.0) as i32, right: ((cw + w) / 2.0) as i32, bottom: ((ch + h) / 2.0) as i32 };
+                        if engine.TransferVideoFrame(&bb, None, &dst, Some(&black)).is_ok() {
+                            let _ = swap.Present(0, DXGI_PRESENT(0));
+                        }
+                    }
+                }
+            }
+            // ждать следующего обновления экрана — ровный темп без лишней нагрузки
+            match &output {
+                Some(o) if o.WaitForVBlank().is_ok() => {}
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        CoUninitialize();
     }
 }
 
@@ -80,7 +211,9 @@ pub struct MediaView {
     pub path: PathBuf,
     engine: Option<IMFMediaEngine>,
     d3d: Option<D3d>,
-    pub frame: Option<Rc<Img>>,
+    out: Option<VideoOut>,
+    /// Размер кадра видео (0 — ещё неизвестен).
+    pub native: (u32, u32),
     pub is_video: bool,
     pub ready: bool,
     pub error: Option<String>,
@@ -91,17 +224,27 @@ pub struct MediaView {
     pub muted: bool,
     pub looped: bool,
     pub rate: f64,
-    last_pts: i64,
     wave: Option<Vec<u8>>,
     wave_rx: Option<Receiver<Vec<u8>>>,
     pub meta: String,
     seek_rect: RECT,
     seeking: bool,
     hover_x: Option<i32>,
+    bar_px: i32,
 }
 
 impl Drop for MediaView {
     fn drop(&mut self) {
+        if let Some(mut o) = self.out.take() {
+            o.shared.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = o.thread.take() {
+                let _ = t.join();
+            }
+            unsafe {
+                SetWindowLongPtrW(o.hwnd, GWLP_USERDATA, 0);
+                let _ = DestroyWindow(o.hwnd);
+            }
+        }
         if let Some(e) = self.engine.take() {
             unsafe {
                 let _ = e.Shutdown();
@@ -122,10 +265,10 @@ impl MediaView {
     pub fn open(hwnd: HWND, path: &Path, is_video: bool) -> MediaView {
         startup();
         let mut v = MediaView {
-            path: path.to_path_buf(), engine: None, d3d: None, frame: None, is_video, ready: false, error: None,
+            path: path.to_path_buf(), engine: None, d3d: None, out: None, native: (0, 0), is_video, ready: false, error: None,
             duration: 0.0, pos: 0.0, playing: false, volume: crate::settings::get_i("volume", 80) as f64 / 100.0,
-            muted: false, looped: false, rate: 1.0, last_pts: -1, wave: None, wave_rx: None, meta: String::new(),
-            seek_rect: RECT::default(), seeking: false, hover_x: None,
+            muted: false, looped: false, rate: 1.0, wave: None, wave_rx: None, meta: String::new(),
+            seek_rect: RECT::default(), seeking: false, hover_x: None, bar_px: 0,
         };
         v.meta = describe(path);
         if let Err(e) = v.create(hwnd) {
@@ -165,9 +308,51 @@ impl MediaView {
             let url = BSTR::from(self.path.to_string_lossy().as_ref());
             engine.SetSource(&url).map_err(|e| e.message().to_string())?;
             let _ = engine.SetAutoPlay(true);
+            // окно-«экран» и поток показа
+            if let Some(d) = &self.d3d {
+                let child = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), video_class(), w!(""), WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 64, 64, hwnd, None,
+                    windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default(), None,
+                );
+                if let Ok(child) = child {
+                    if let Some(swap) = create_swap(d, child) {
+                        let shared = Arc::new(Shared { stop: AtomicBool::new(false), size: Mutex::new((64, 64)), redraw: AtomicBool::new(true) });
+                        SetWindowLongPtrW(child, GWLP_USERDATA, Arc::as_ptr(&shared) as isize);
+                        let (e2, s2, sh2) = (Agile(engine.clone()), Agile(swap), shared.clone());
+                        let thread = std::thread::spawn(move || {
+                            let (e, s) = (e2, s2);
+                            render_loop(e.0, s.0, sh2);
+                        });
+                        self.out = Some(VideoOut { hwnd: child, shared, thread: Some(thread), rect: RECT::default() });
+                    } else {
+                        let _ = DestroyWindow(child);
+                    }
+                }
+            }
             self.engine = Some(engine);
         }
         Ok(())
+    }
+
+    /// Разместить окно-экран видео (rc — весь холст; снизу остаётся полоса перемотки).
+    pub fn place(&mut self, ui: &Ui, rc: RECT) {
+        self.bar_px = ui.s(44);
+        let Some(o) = &mut self.out else { return };
+        let area = RECT { bottom: (rc.bottom - self.bar_px).max(rc.top + 1), ..rc };
+        let show = self.is_video && self.error.is_none();
+        unsafe {
+            if area != o.rect {
+                o.rect = area;
+                let (w, h) = ((area.right - area.left).max(1), (area.bottom - area.top).max(1));
+                let _ = MoveWindow(o.hwnd, area.left, area.top, w, h, false);
+                *o.shared.size.lock().unwrap() = (w as u32, h as u32);
+                o.shared.redraw.store(true, Ordering::Relaxed);
+            }
+            let vis = IsWindowVisible(o.hwnd).as_bool();
+            if vis != show {
+                let _ = ShowWindow(o.hwnd, if show { SW_SHOWNA } else { SW_HIDE });
+            }
+        }
     }
 
     /// Событие от Media Engine (через WM_MEDIA).
@@ -182,6 +367,11 @@ impl MediaView {
                 }
                 MF_MEDIA_ENGINE_EVENT_PLAYING | MF_MEDIA_ENGINE_EVENT_PLAY => self.playing = true,
                 MF_MEDIA_ENGINE_EVENT_PAUSE | MF_MEDIA_ENGINE_EVENT_ENDED => self.playing = false,
+                MF_MEDIA_ENGINE_EVENT_SEEKED => {
+                    if let Some(o) = &self.out {
+                        o.shared.redraw.store(true, Ordering::Relaxed);
+                    }
+                }
                 MF_MEDIA_ENGINE_EVENT_ERROR => {
                     let code = e.GetError().map(|er| er.GetErrorCode()).unwrap_or(0);
                     self.error = Some(match code {
@@ -196,7 +386,8 @@ impl MediaView {
         }
     }
 
-    /// Раз в кадр: новый кадр видео, позиция, волна. true — перерисовать.
+    /// Раз в ~40 мс: позиция, состояние, волна. Кадры показывает свой поток.
+    /// true — перерисовать полосу перемотки (только если она заметно сдвинулась).
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
         if let Some(rx) = &self.wave_rx {
@@ -209,7 +400,10 @@ impl MediaView {
         let Some(e) = self.engine.clone() else { return changed };
         unsafe {
             let p = e.GetCurrentTime();
-            if (p - self.pos).abs() > 0.03 {
+            // сдвиг хотя бы на точку полосы или смена секунды на часах
+            let track = (self.seek_rect.right - self.seek_rect.left).max(100) as f64;
+            let px = if self.duration > 0.0 { (p - self.pos).abs() / self.duration * track } else { 0.0 };
+            if px >= 1.0 || p.floor() != self.pos.floor() {
                 self.pos = p;
                 changed = true;
             }
@@ -218,67 +412,15 @@ impl MediaView {
                 self.playing = playing;
                 changed = true;
             }
-            if self.is_video {
-                if let Ok(pts) = e.OnVideoStreamTick() {
-                    if pts != self.last_pts && self.grab(&e) {
-                        self.last_pts = pts;
-                        changed = true;
-                    }
+            if self.is_video && self.native == (0, 0) {
+                let (mut w, mut h) = (0u32, 0u32);
+                if e.GetNativeVideoSize(Some(&mut w), Some(&mut h)).is_ok() && w > 0 {
+                    self.native = (w, h);
+                    changed = true;
                 }
             }
         }
         changed
-    }
-
-    /// Забрать текущий кадр: Media Engine → текстура → копия в память.
-    fn grab(&mut self, e: &IMFMediaEngine) -> bool {
-        let Some(d) = &mut self.d3d else { return false };
-        unsafe {
-            let (mut w, mut h) = (0u32, 0u32);
-            if e.GetNativeVideoSize(Some(&mut w), Some(&mut h)).is_err() || w == 0 || h == 0 {
-                return false;
-            }
-            if d.tex.as_ref().map(|t| (t.2, t.3) != (w, h)).unwrap_or(true) {
-                let mut desc = D3D11_TEXTURE2D_DESC {
-                    Width: w, Height: h, MipLevels: 1, ArraySize: 1, Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32, CPUAccessFlags: 0, MiscFlags: 0,
-                };
-                let mut target = None;
-                if d.device.CreateTexture2D(&desc, None, Some(&mut target)).is_err() {
-                    return false;
-                }
-                desc.Usage = D3D11_USAGE_STAGING;
-                desc.BindFlags = 0;
-                desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-                let mut staging = None;
-                if d.device.CreateTexture2D(&desc, None, Some(&mut staging)).is_err() {
-                    return false;
-                }
-                d.tex = Some((target.unwrap(), staging.unwrap(), w, h));
-            }
-            let (target, staging, w, h) = d.tex.clone().unwrap();
-            let dst = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
-            if e.TransferVideoFrame(&target, None, &dst, None).is_err() {
-                return false;
-            }
-            d.ctx.CopyResource(&staging, &target);
-            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-            if d.ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m)).is_err() {
-                return false;
-            }
-            let mut px = vec![0u8; (w * h * 4) as usize];
-            for y in 0..h as usize {
-                let src = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), w as usize * 4);
-                px[y * w as usize * 4..(y + 1) * w as usize * 4].copy_from_slice(src);
-            }
-            d.ctx.Unmap(&staging, 0);
-            for p in px.chunks_exact_mut(4) {
-                p[3] = 255;
-            }
-            self.frame = Some(Rc::new(Img { w, h, px }));
-            true
-        }
     }
 
     pub fn toggle_play(&mut self) {
@@ -362,8 +504,8 @@ impl MediaView {
 
     pub fn info(&self) -> String {
         let mut v = vec![format!("{} / {}", fmt_time(self.pos), fmt_time(self.duration))];
-        if let Some(f) = &self.frame {
-            v.push(format!("{} × {}", f.w, f.h));
+        if self.native.0 > 0 {
+            v.push(format!("{} × {}", self.native.0, self.native.1));
         }
         if (self.rate - 1.0).abs() > 0.01 {
             v.push(format!("×{}", self.rate));
@@ -377,15 +519,9 @@ impl MediaView {
         let bar_h = ui.s(44);
         let area = RECT { bottom: rc.bottom - bar_h, ..rc };
         if self.is_video {
+            // сам кадр рисует окно-экран поверх (GPU); здесь — только фон
             gui::fill(hdc, &rc, crate::util::rgb(0, 0, 0));
-            if let Some(f) = &self.frame {
-                let (aw, ah) = ((area.right - area.left) as f64, (area.bottom - area.top) as f64);
-                let k = (aw / f.w as f64).min(ah / f.h as f64);
-                let (w, h) = ((f.w as f64 * k) as i32, (f.h as f64 * k) as i32);
-                let x = area.left + ((aw as i32 - w) / 2);
-                let y = area.top + ((ah as i32 - h) / 2);
-                gui::blit(hdc, f, &gui::r(x, y, w, h), hq || !self.playing);
-            }
+            let _ = hq;
         } else {
             gui::fill(hdc, &rc, t.canvas);
             // название и сведения
@@ -423,7 +559,7 @@ impl MediaView {
                 let f = ((hx - sb.left) as f64 / (sb.right - sb.left).max(1) as f64).clamp(0.0, 1.0);
                 let s = fmt_time(f * self.duration);
                 let tw = ui.tw(ui.f.small, &s) + ui.s(12);
-                let b = gui::r((hx - tw / 2).clamp(sb.left, sb.right - tw), sb.top - ui.s(24), tw, ui.s(20));
+                let b = gui::r((hx - tw / 2).clamp(sb.left + ui.s(60), sb.right - tw - ui.s(60)), sb.bottom - ui.s(1), tw, ui.s(18));
                 gui::round(hdc, &b, ui.s(6), Some(t.tip_bg), None);
                 gui::text(hdc, &s, &b, ui.f.small, t.tip_text, gui::CENTER);
             }
@@ -467,9 +603,44 @@ impl MediaView {
         }
     }
 
-    /// Текущий кадр (для «Кадр → фото»).
+    /// Текущий кадр (для «Кадр → фото»): по запросу, в полном размере.
     pub fn snapshot(&self) -> Option<Img> {
-        self.frame.as_ref().map(|f| (**f).clone())
+        let (d, e) = (self.d3d.as_ref()?, self.engine.as_ref()?);
+        let (w, h) = self.native;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        unsafe {
+            let mut desc = D3D11_TEXTURE2D_DESC {
+                Width: w, Height: h, MipLevels: 1, ArraySize: 1, Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32, CPUAccessFlags: 0, MiscFlags: 0,
+            };
+            let mut target = None;
+            d.device.CreateTexture2D(&desc, None, Some(&mut target)).ok()?;
+            let target = target?;
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            let mut staging = None;
+            d.device.CreateTexture2D(&desc, None, Some(&mut staging)).ok()?;
+            let staging = staging?;
+            let dst = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+            e.TransferVideoFrame(&target, None, &dst, None).ok()?;
+            d.ctx.CopyResource(&staging, &target);
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            d.ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m)).ok()?;
+            let mut px = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h as usize {
+                let src = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), w as usize * 4);
+                px[y * w as usize * 4..(y + 1) * w as usize * 4].copy_from_slice(src);
+            }
+            d.ctx.Unmap(&staging, 0);
+            for p in px.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+            Some(Img { w, h, px })
+        }
     }
 }
 

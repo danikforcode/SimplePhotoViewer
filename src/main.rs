@@ -4,16 +4,22 @@
 
 mod clip;
 mod codec;
+mod bench;
+mod canvas;
 mod collage;
 mod convert;
 mod convert_dlg;
 mod doc;
+mod draw;
+mod edit;
+mod fields;
 mod files;
 mod gui;
 mod highlight;
 mod image_buf;
 mod table;
 mod textview;
+mod resize_dlg;
 mod richdoc;
 mod rtf;
 mod textenc;
@@ -22,6 +28,7 @@ mod imgfmt;
 mod kinds;
 mod media;
 mod merge;
+mod pager;
 mod peek;
 mod pdf_read;
 mod pdf_write;
@@ -41,5 +48,16 @@ fn main() {
     }));
     codec::init();
     let args: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(std::path::PathBuf::from).collect();
+    // замеры и нагрузочная проверка — без окна
+    match args.first().and_then(|a| a.to_str()) {
+        Some("--bench") => return bench::bench(args.get(1).cloned()),
+        Some("--stress") => {
+            let n = args.get(1).and_then(|a| a.to_str()).and_then(|s| s.parse().ok());
+            let out = if n.is_some() { args.get(2) } else { args.get(1) };
+            return bench::stress(n.unwrap_or(1000), out.cloned());
+        }
+        _ => {}
+    }
     ui::run(args);
+    gui::trace::report();
 }

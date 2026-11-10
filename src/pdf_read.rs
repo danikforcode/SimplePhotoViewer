@@ -24,9 +24,10 @@ pub struct PdfInfo {
     pub pages: Vec<(f64, f64)>,
 }
 
+/// Открытые документы (последний — в конце). Несколько: соседние файлы
+/// для «подглядывания» не должны выталкивать открытую книгу.
 struct Cache {
-    path: Option<PathBuf>,
-    doc: Option<PdfDocument>,
+    docs: Vec<(PathBuf, PdfDocument)>,
 }
 
 type Job = Box<dyn FnOnce(&mut Cache) + Send>;
@@ -39,7 +40,7 @@ fn worker() -> &'static Mutex<Sender<Job>> {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
-            let mut c = Cache { path: None, doc: None };
+            let mut c = Cache { docs: vec![] };
             while let Ok(job) = rx.recv() {
                 job(&mut c);
             }
@@ -69,8 +70,10 @@ fn err(e: windows::core::Error) -> String {
 }
 
 fn open_doc<'a>(c: &'a mut Cache, path: &Path) -> Result<&'a PdfDocument, String> {
-    if c.path.as_deref() != Some(path) || c.doc.is_none() {
-        c.doc = None;
+    if let Some(i) = c.docs.iter().position(|d| d.0 == path) {
+        let d = c.docs.remove(i);
+        c.docs.push(d);
+    } else {
         let full = std::path::absolute(path).map_err(|e| e.to_string())?;
         let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(full.as_os_str()))
             .and_then(|op| op.get())
@@ -83,10 +86,12 @@ fn open_doc<'a>(c: &'a mut Cache, path: &Path) -> Result<&'a PdfDocument, String
                 m
             }
         })?;
-        c.doc = Some(doc);
-        c.path = Some(path.to_path_buf());
+        if c.docs.len() >= 3 {
+            c.docs.remove(0);
+        }
+        c.docs.push((path.to_path_buf(), doc));
     }
-    Ok(c.doc.as_ref().unwrap())
+    Ok(&c.docs.last().unwrap().1)
 }
 
 /// Открыть PDF: количество и размеры страниц.
@@ -111,6 +116,9 @@ pub fn info(path: &Path) -> Result<PdfInfo, String> {
 /// Нарисовать страницу шириной `width` пикселей (высота — по пропорциям).
 pub fn render(path: &Path, index: u32, width: u32) -> Result<Img, String> {
     let path = path.to_path_buf();
+    if let Some(ms) = fake_delay() {
+        return call(move |_| Ok(fake_page(index, width, ms)));
+    }
     let bytes = call(move |c| {
         let doc = open_doc(c, &path)?;
         let page = doc.GetPage(index).map_err(err)?;
@@ -138,8 +146,38 @@ pub fn render(path: &Path, index: u32, width: u32) -> Result<Img, String> {
 /// Забыть открытый документ (например, перед перезаписью файла).
 pub fn forget() {
     let _ = call(|c| {
-        c.doc = None;
-        c.path = None;
+        c.docs.clear();
         Ok(())
     });
+}
+
+/// Для замеров без Windows.Data.Pdf (Wine): SPV_FAKE_PDF=<мс на 1000 точек ширины>
+/// — вместо отрисовки серая «страница» с полосами и задержкой, как у настоящей.
+fn fake_delay() -> Option<u64> {
+    static D: OnceLock<Option<u64>> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("SPV_FAKE_PDF").ok().and_then(|v| v.parse().ok()))
+}
+
+fn fake_page(index: u32, width: u32, ms: u64) -> Img {
+    let w = width.max(16);
+    let h = (w as f64 * 1.414) as u32;
+    std::thread::sleep(std::time::Duration::from_millis(ms * w as u64 * h as u64 / 1_414_000));
+    let mut img = Img::filled(w, h, [255, 255, 255]);
+    // строки «текста» и номер страницы полосками сверху
+    let line = (h / 60).max(1);
+    for y in 0..h {
+        let row = y / line;
+        let ink = row > 6 && row % 2 == 0 && row < 56;
+        let head = row < 5 && (y * 8 / h.max(1)) == 0;
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let m = x > w / 10 && x < w * 9 / 10;
+            if (ink && m && (x / (line * 3) + row) % 7 != 0) || (head && x > w / 10 && x < w / 10 + (index % 20 + 1) * w / 30) {
+                img.px[i] = 60;
+                img.px[i + 1] = 60;
+                img.px[i + 2] = 60;
+            }
+        }
+    }
+    img
 }

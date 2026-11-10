@@ -29,6 +29,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 use windows::Win32::UI::Shell::DragAcceptFiles;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+#[path = "ui_editor.rs"]
+mod editor;
+use editor::*;
+
 pub const APP_NAME: &str = "SimplePhotoViewer";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HISTORY: usize = 10;
@@ -86,6 +90,7 @@ const ID_DEL_PAGE: u32 = 171;
 const ID_MOVE_L: u32 = 172;
 const ID_MOVE_R: u32 = 173;
 const ID_COLLAGE: u32 = 180;
+const ID_CANVAS: u32 = 183;
 const ID_MERGE: u32 = 181;
 const ID_CONVERT: u32 = 182;
 const ID_THEME_SYS: u32 = 190;
@@ -106,7 +111,8 @@ const ID_HEADER: u32 = 310;
 const ID_UNSORT: u32 = 311;
 const ID_COPY_ROW: u32 = 312;
 
-const TABS: [&str; 5] = ["Главная", "Правка", "Страницы", "Создать", "Вид"];
+const TABS: [&str; 6] = ["Главная", "Правка", "Страницы", "Создать", "Вид", "Рисование"];
+const TAB_DRAW: usize = 5;
 
 /// Что сейчас на холсте.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -186,6 +192,15 @@ pub struct App {
     peek_hover: i8,
     anim: Option<Anim>,
     overflow: Vec<(u32, String)>,
+    /// Редактор фото: выделение, настройки, рисование.
+    ed: Editor,
+    /// Во весь экран: мышь у верхнего края (показать кнопку выхода).
+    full_hover: bool,
+    /// Фоновая отрисовка страниц.
+    pager: Option<crate::pager::Pager>,
+    page_err: HashMap<usize, String>,
+    /// На экране — временная (грубая) картинка страницы, точная рисуется.
+    view_pending: bool,
 }
 
 fn key_down(vk: i32) -> bool {
@@ -201,6 +216,7 @@ impl App {
             hq: true, tab: settings::get_i("tab", 0).clamp(0, 4) as usize, full: None, status: String::new(),
             scroll_mode: settings::get_i("doc_scroll", 0) == 1, work: false, sy: 0.0, page_cache: HashMap::new(), page_thumbs: HashMap::new(),
             peeker: None, peek_l: RECT::default(), peek_r: RECT::default(), peek_hover: 0, anim: None, overflow: vec![],
+            ed: Editor::new(), full_hover: false, pager: None, page_err: HashMap::new(), view_pending: false,
         }
     }
 
@@ -353,8 +369,19 @@ impl App {
                 if self.scrolling() {
                     parts.push(format!("{}%", (self.zoom * 100.0).round() as i64));
                 } else if let Some(v) = &self.view {
-                    parts.push(format!("{} × {} px", v.w, v.h));
-                    parts.push(format!("{}%", (self.scale() * 100.0).round() as i64));
+                    if let Some(b) = self.ed.sel.as_ref().and_then(|s| s.bbox()) {
+                        parts.push(format!("выделено {} × {}", b.2, b.3));
+                    }
+                    // пока страница дорисовывается — размеры будущей, а не наброска
+                    let (w, h) = match (self.view_pending, self.pages.get(self.cur).and_then(|p| p.size_pt())) {
+                        (true, Some((pw, ph))) => {
+                            let w = self.page_job(self.cur, self.book_px(self.cur)).map(|j| j.0 as f64).unwrap_or(pw);
+                            (w, w * ph / pw.max(1.0))
+                        }
+                        _ => (v.w as f64, v.h as f64),
+                    };
+                    parts.push(format!("{} × {} px", w.round(), h.round()));
+                    parts.push(format!("{}%", (self.scale() * v.w as f64 / w.max(1.0) * 100.0).round() as i64));
                 }
                 if self.pages.len() > 1 {
                     parts.push(format!("стр. {} / {}", self.cur + 1, self.pages.len()));
@@ -383,10 +410,104 @@ impl App {
     fn pages_changed(&mut self) {
         self.page_cache.clear();
         self.page_thumbs.clear();
+        self.page_err.clear();
+        self.view_pending = false;
+        if let Some(p) = &mut self.pager {
+            p.reset();
+        }
+    }
+
+    /// Задание для фонового потока: страница PDF шириной w точек или фото не больше max.
+    fn page_job(&self, i: usize, want_px: f64) -> Option<(u32, crate::pager::Job)> {
+        let p = self.pages.get(i)?;
+        if p.img.is_some() {
+            return None;
+        }
+        match &p.src {
+            Src::Pdf { path, index, size } => {
+                // ширина в точках с шагом 128 — чтобы не перерисовывать на каждый пиксель масштаба
+                let cap = 6000.0 * size.0 / size.0.max(size.1).max(1.0);
+                let w = (want_px.max(96.0) / 128.0).ceil() * 128.0;
+                let w = w.min(cap.max(128.0)) as u32;
+                Some((w, crate::pager::Job::Pdf { path: path.clone(), index: *index, width: w }))
+            }
+            Src::File(path) => {
+                let max = if want_px <= 0.0 { 0 } else { ((want_px / 512.0).ceil() * 512.0).min(8192.0) as u32 };
+                Some((if max == 0 { u32::MAX } else { max }, crate::pager::Job::File { path: path.clone(), max }))
+            }
+            _ => None,
+        }
+    }
+
+    /// Ширина страницы i в точках при «Книге» (VIEW_DPI).
+    fn book_px(&self, i: usize) -> f64 {
+        self.pages.get(i).and_then(|p| p.size_pt()).map(|s| s.0 / 72.0 * doc::VIEW_DPI).unwrap_or(0.0)
+    }
+
+    fn cache_put(&mut self, i: usize, key: f64, img: Rc<Img>) {
+        if self.page_cache.get(&i).map(|c| c.0 >= key).unwrap_or(false) {
+            return;
+        }
+        self.page_cache.insert(i, (key, img));
+        // не больше ~80 Мп в памяти: выбрасываем дальние от текущей страницы
+        let total = |c: &HashMap<usize, (f64, Rc<Img>)>| c.values().map(|v| v.1.w as u64 * v.1.h as u64).sum::<u64>();
+        let cur = self.cur as isize;
+        while total(&self.page_cache) > 80_000_000 && self.page_cache.len() > 3 {
+            let far = *self.page_cache.keys().max_by_key(|k| (**k as isize - cur).abs()).unwrap();
+            if (far as isize - cur).abs() <= 1 {
+                break;
+            }
+            self.page_cache.remove(&far);
+        }
+    }
+
+    /// Готовые страницы из фонового потока.
+    fn pages_ready(&mut self) {
+        let done = self.pager.as_ref().map(|p| p.poll()).unwrap_or_default();
+        for d in done {
+            match d.img {
+                Ok(img) => {
+                    let img = Rc::new(img);
+                    self.cache_put(d.page, d.key as f64, img.clone());
+                    if self.view_pending && d.page == self.cur && !self.scrolling() {
+                        // показать лучшее, что есть: набросок сразу, точную — когда готова
+                        let need = self.page_job(self.cur, self.book_px(self.cur)).map(|j| j.0).unwrap_or(0);
+                        if let Some((k, best)) = self.page_cache.get(&d.page) {
+                            self.view = Some(best.clone());
+                            if *k as u32 >= need {
+                                self.view_pending = false;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if d.page == self.cur && self.view_pending && !self.scrolling() {
+                        self.view = None;
+                        self.view_err = Some(e.clone());
+                        self.view_pending = false;
+                    }
+                    self.page_err.insert(d.page, e);
+                }
+            }
+        }
+    }
+
+    /// Временную картинку страницы заменить точной (перед правкой, копированием).
+    pub(crate) fn ensure_full_view(&mut self) {
+        if !self.view_pending {
+            return;
+        }
+        self.view_pending = false;
+        if let Some(p) = self.pages.get(self.cur) {
+            if let Ok(i) = doc::render(p, doc::VIEW_DPI) {
+                self.view = Some(i);
+            }
+        }
     }
 
     /// Показать текущую страницу (загрузить/нарисовать при необходимости).
     fn refresh_view(&mut self) {
+        self.reset_editor();
         self.crop = None;
         self.crop_mode = false;
         self.reset_view();
@@ -395,14 +516,72 @@ impl App {
         if self.scrolling() {
             return;
         }
-        let Some(p) = self.pages.get(self.cur) else { return };
+        self.view_pending = false;
+        let cur = self.cur;
+        let Some(p) = self.pages.get(cur) else { return };
+        // PDF: если готовой страницы нет — сразу грубый набросок, точная — в фоне
+        if let (Some((need, job)), true) = (self.page_job(cur, self.book_px(cur)), matches!(p.src, Src::Pdf { .. })) {
+            if let Some((k, img)) = self.page_cache.get(&cur) {
+                self.view = Some(img.clone());
+                if *k as u32 >= need {
+                    self.prefetch_book();
+                    return;
+                }
+            }
+            if let Some(e) = self.page_err.get(&cur) {
+                self.view_err = Some(e.clone());
+                return;
+            }
+            if self.view.is_none() {
+                // пока рисуется — чистый лист нужной формы (поток окна не ждёт)
+                let (pw, ph) = p.size_pt().unwrap_or((595.0, 842.0));
+                self.view = Some(Rc::new(Img::filled(64, ((64.0 * ph / pw.max(1.0)) as u32).clamp(8, 512), [255, 255, 255])));
+            }
+            self.view_pending = true;
+            let rot = p.rot;
+            // сначала грубый набросок (очередь — «последний первым»), потом точная
+            let quick = self.page_job(cur, need as f64 / 4.0);
+            if let Some(pg) = &self.pager {
+                pg.want(cur, need, rot, job);
+            }
+            self.prefetch_book();
+            if let (Some(pg), Some((qk, qj))) = (&self.pager, quick) {
+                if !self.page_cache.contains_key(&cur) {
+                    pg.want(cur, qk, rot, qj);
+                }
+            }
+            return;
+        }
         match doc::render(p, doc::VIEW_DPI) {
             Ok(i) => self.view = Some(i),
             Err(e) => self.view_err = Some(e),
         }
+        self.prefetch_book();
+    }
+
+    /// Заранее нарисовать соседние страницы — листание будет мгновенным.
+    fn prefetch_book(&self) {
+        let Some(pg) = &self.pager else { return };
+        for d in [2isize, -1, 1] {
+            let i = self.cur as isize + d;
+            if i < 0 || i as usize >= self.pages.len() {
+                continue;
+            }
+            let i = i as usize;
+            if !matches!(self.pages[i].src, Src::Pdf { .. }) {
+                continue;
+            }
+            if let Some((need, job)) = self.page_job(i, self.book_px(i)) {
+                if self.page_cache.get(&i).map(|c| c.0 as u32 >= need).unwrap_or(false) {
+                    continue;
+                }
+                pg.want(i, need, self.pages[i].rot, job);
+            }
+        }
     }
 
     fn confirm_discard(&mut self) -> bool {
+        self.commit_pending();
         if self.text_dirty() {
             let r = unsafe {
                 MessageBoxW(self.hwnd, w!("Текст изменён. Сохранить изменения?"), &HSTRING::from(APP_NAME), MB_YESNOCANCEL | MB_ICONQUESTION)
@@ -431,6 +610,7 @@ impl App {
         if let Viewer::Media(m) = &mut self.viewer {
             m.pause();
         }
+        self.reset_editor();
         self.viewer = Viewer::None;
         self.work = false;
         unsafe {
@@ -503,7 +683,7 @@ impl App {
                             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.hwnd);
                         }
                         Viewer::Media(_) => {
-                            SetTimer(self.hwnd, TIMER_MEDIA, 15, None);
+                            SetTimer(self.hwnd, TIMER_MEDIA, 40, None);
                         }
                         _ => {}
                     }
@@ -630,6 +810,8 @@ impl App {
 
     /// «Сохранить как». pdf — сразу предложить PDF.
     fn save_as(&mut self, pdf: bool) -> bool {
+        self.commit_pending();
+        self.ensure_full_view();
         if self.mode() == Mode2::Text {
             return self.save_text(true);
         }
@@ -704,7 +886,7 @@ impl App {
         match self.mode() {
             Mode2::Text | Mode2::Table => true,
             Mode2::Pages => self.view_err.is_none() && !self.pages_are_files()
-                && (self.pages.len() > 1 || matches!(self.kind, Some(FK::Pdf | FK::Doc))),
+                && (self.pages.len() > 1 || matches!(self.kind, Some(FK::Pdf | FK::Doc)) || self.can_edit()),
             _ => false,
         }
     }
@@ -718,6 +900,7 @@ impl App {
             Mode2::Text => ("Править", 0xE70F, "Править текст: курсор, ввод, поиск (Enter или щелчок по тексту)"),
             Mode2::Table => ("Работать", gui::IC_GRID, "Ходить по ячейкам, сортировать, копировать (Enter или щелчок по таблице)"),
             _ if matches!(self.kind, Some(FK::Pdf | FK::Doc)) => ("Читать", gui::IC_BOOK, "Читать документ: стрелки листают страницы (Enter или двойной щелчок)"),
+            _ if self.pages.len() == 1 => ("Править", 0xE70F, "Править фото: выделение, настройка, эффекты, рисование (Enter)"),
             _ => ("Страницы", gui::IC_BOOK, "Листать страницы этого документа (Enter)"),
         }
     }
@@ -726,9 +909,19 @@ impl App {
         if on && !self.can_work() || self.work == on {
             return;
         }
+        if !on {
+            // уходим из работы — всё недоделанное применяется
+            self.commit_pending();
+            self.ed.tool = ETool::None;
+            self.crop_mode = false;
+            self.crop = None;
+        }
         self.work = on;
         self.peek_hover = 0;
         self.anim = None;
+        if on && self.mode() == Mode2::Pages && self.pages.len() == 1 && self.can_edit() && self.tab != TAB_DRAW {
+            self.tab = 1;
+        }
         if let Viewer::Text(t) = &self.viewer {
             if on {
                 t.focus();
@@ -742,6 +935,7 @@ impl App {
             let hint = match self.mode() {
                 Mode2::Text => "Правка · Esc — к файлам",
                 Mode2::Table => "Работа с таблицей: стрелки — по ячейкам · Esc — к файлам",
+                Mode2::Pages if self.pages.len() == 1 => "Правка фото: вкладки «Правка» и «Рисование» · Esc — к файлам",
                 _ => "Чтение: ← → — страницы · Esc — к файлам",
             };
             self.set_status(hint);
@@ -784,6 +978,7 @@ impl App {
 
     /// ← → : в обзоре — соседний файл; в работе — страница документа.
     fn step(&mut self, d: isize) {
+        self.commit_pending();
         if self.viewer_is_none() && self.pages.len() > 1 && (self.work || self.pages_are_files()) {
             let n = self.cur as isize + d;
             if n >= 0 && (n as usize) < self.pages.len() {
@@ -806,6 +1001,7 @@ impl App {
 
     /// Соседний файл папки (из любого режима: Alt+← →, Ctrl+PgUp/PgDn, хвостики).
     fn step_file(&mut self, d: isize) {
+        self.commit_pending();
         let n = self.files.len() as isize;
         let j = self.idx + d;
         if self.idx < 0 || j < 0 || j >= n || !self.confirm_discard() {
@@ -844,12 +1040,26 @@ impl App {
             t.undo();
             return;
         }
+        if self.has_shapes() {
+            // сначала — несохранённый рисунок
+            self.undo_shape();
+            return;
+        }
         if let Some((pages, cur)) = self.history.pop() {
+            let sel = self.ed.sel.take();
+            let tool = self.ed.tool;
             self.pages = pages;
             self.cur = cur.min(self.pages.len().saturating_sub(1));
             self.dirty = !self.history.is_empty();
             self.pages_changed();
             self.refresh_view();
+            // выделение и инструмент остаются, если размер фото тот же
+            if let (Some(sel), Some(v)) = (sel, &self.view) {
+                if sel.w == v.w && sel.h == v.h {
+                    self.ed.sel = Some(sel);
+                }
+            }
+            self.ed.tool = tool;
         }
     }
 
@@ -867,10 +1077,14 @@ impl App {
         } else {
             k
         });
+        let resized = (new.w, new.h) != (v.w, v.h);
         p.img = Some(Rc::new(new));
         p.rot = 0;
         p.ppx = ppx;
         self.view = p.img.clone();
+        if resized {
+            self.clear_sel();
+        }
         self.crop = None;
         self.crop_mode = false;
         self.reset_view();
@@ -990,11 +1204,26 @@ impl App {
         if self.view.is_none() {
             return;
         }
+        self.commit_pending();
+        // есть выделение — обрезать по нему сразу
+        if let Some(b) = self.ed.sel.as_ref().and_then(|s| s.bbox()) {
+            self.edit(|i| Some(i.crop(b.0, b.1, b.2, b.3)));
+            self.clear_sel();
+            self.set_status("Обрезано по выделению");
+            return;
+        }
         if self.crop_mode && self.crop.is_some() {
             return self.apply_crop();
         }
+        if !self.work && self.can_work() {
+            self.set_work(true);
+        }
+        self.ed.tool = ETool::None;
         self.crop_mode = !self.crop_mode;
         self.crop = None;
+        if self.crop_mode {
+            self.crop_start();
+        }
     }
 
     fn apply_crop(&mut self) {
@@ -1008,6 +1237,7 @@ impl App {
     }
 
     fn print(&mut self) {
+        self.commit_pending();
         if self.pages.is_empty() {
             return;
         }
@@ -1022,13 +1252,19 @@ impl App {
             .pages
             .iter()
             .filter(|p| !p.is_docpage() || p.img.is_some())
-            .map(|p| crate::collage::Item { label: p.label(), path: p.path().map(|x| x.to_path_buf()), img: p.img.clone() })
+            .map(|p| crate::collage::Item { path: p.path().map(|x| x.to_path_buf()), img: p.img.clone() })
             .collect();
-        if let Some(img) = crate::collage::run(self.hwnd, items) {
+        self.canvas_open(items, true);
+    }
+
+    /// Холст (пустой — как в Paint) или коллаж из открытых фото.
+    fn canvas_open(&mut self, items: Vec<crate::collage::Item>, collage: bool) {
+        if let Some(img) = crate::canvas::run(self.hwnd, items, collage) {
             if !self.confirm_discard() {
                 return;
             }
-            self.set_doc(vec![Page::mem("Коллаж", img)], "Коллаж".into(), None, true);
+            let name = if collage { "Коллаж" } else { "Холст" };
+            self.set_doc(vec![Page::mem(name, img)], name.into(), None, true);
         }
     }
 
@@ -1123,6 +1359,7 @@ impl App {
 
     fn toggle_full(&mut self) {
         let hwnd = self.hwnd;
+        self.full_hover = false;
         unsafe {
             match self.full.take() {
                 Some((wp, style)) => {
@@ -1220,34 +1457,43 @@ impl App {
         }
     }
     /// Картинка страницы i шириной не меньше px точек (из кэша или заново).
-    fn page_img(&mut self, i: usize, px: f64) -> std::result::Result<Rc<Img>, String> {
-        let p = &self.pages[i];
-        let dpi = match p.size_pt() {
-            Some((w, _)) => {
-                let d = (px / (w / 72.0)).clamp(24.0, 300.0);
-                (d / 24.0).ceil() * 24.0
+    /// Картинка страницы i шириной около px точек: готовая, временная (грубее) или None.
+    /// Не ждёт: недостающее заказывается фоновому потоку.
+    fn page_img(&mut self, i: usize, px: f64) -> std::result::Result<Option<Rc<Img>>, String> {
+        if let Some(e) = self.page_err.get(&i) {
+            return Err(e.clone());
+        }
+        match self.page_job(i, px) {
+            Some((need, job)) => {
+                let have = self.page_cache.get(&i).cloned();
+                if let Some((k, img)) = &have {
+                    if *k as u32 >= need {
+                        return Ok(Some(img.clone()));
+                    }
+                }
+                let quick = if have.is_none() && matches!(job, crate::pager::Job::Pdf { .. }) { self.page_job(i, px / 4.0) } else { None };
+                if let Some(pg) = &self.pager {
+                    let rot = self.pages[i].rot;
+                    pg.want(i, need, rot, job);
+                    // набросок раньше точной (очередь — «последний первым»)
+                    if let Some((qk, qj)) = quick {
+                        pg.want(i, qk, rot, qj);
+                    }
+                }
+                Ok(have.map(|h| h.1))
             }
-            None => 0.0,
-        };
-        if let Some((d, img)) = self.page_cache.get(&i) {
-            if *d >= dpi {
-                return Ok(img.clone());
+            None => {
+                // фото в памяти, страница документа — быстро и сразу
+                if let Some((_, img)) = self.page_cache.get(&i) {
+                    return Ok(Some(img.clone()));
+                }
+                let p = &self.pages[i];
+                let dpi = p.size_pt().map(|s| ((px / (s.0 / 72.0)).clamp(24.0, 300.0) / 24.0).ceil() * 24.0).unwrap_or(96.0);
+                let img = doc::render(p, dpi)?;
+                self.cache_put(i, f64::MAX, img.clone());
+                Ok(Some(img))
             }
         }
-        let img = doc::render(p, dpi.max(24.0))?;
-        if self.page_cache.len() > 14 {
-            let cur = self.cur as isize;
-            let far: Vec<usize> = {
-                let mut k: Vec<usize> = self.page_cache.keys().copied().collect();
-                k.sort_by_key(|x| std::cmp::Reverse((*x as isize - cur).abs()));
-                k.into_iter().take(self.page_cache.len() - 10).collect()
-            };
-            for f in far {
-                self.page_cache.remove(&f);
-            }
-        }
-        self.page_cache.insert(i, (dpi, img.clone()));
-        Ok(img)
     }
 
     fn paint_scroll(&mut self, ui: &Ui, hdc: HDC) {
@@ -1271,7 +1517,12 @@ impl App {
             let rc = gui::r(x.round() as i32, top.round() as i32, w.round() as i32, h.round().max(1.0) as i32);
             gui::fill(hdc, &gui::r(rc.left + 2, rc.top + 2, rc.right - rc.left, rc.bottom - rc.top), gui::blend(t.canvas, crate::util::rgb(0, 0, 0), if t.dark { 0.6 } else { 0.85 }));
             match self.page_img(i, w) {
-                Ok(img) => gui::blit(hdc, &img, &rc, self.hq),
+                Ok(Some(img)) => gui::blit(hdc, &img, &rc, self.hq),
+                Ok(None) => {
+                    // ещё рисуется: чистый лист с номером
+                    gui::fill(hdc, &rc, crate::util::rgb(255, 255, 255));
+                    gui::text(hdc, &format!("{}", i + 1), &rc, ui.f.big, crate::util::rgb(200, 200, 200), gui::CENTER);
+                }
                 Err(e) => {
                     gui::fill(hdc, &rc, t.card);
                     gui::text(hdc, &e, &rc, ui.f.text, t.dim, gui::WRAP);
@@ -1299,6 +1550,18 @@ impl App {
         if let Some(t) = self.page_thumbs.get(&i) {
             return Some(Rc::new(peek::Peek::Img((**t).clone())));
         }
+        if matches!(p.src, Src::Pdf { .. }) {
+            // PDF — только из готового; иначе заказать и показать позже (окно не ждёт)
+            if let Some((_, img)) = self.page_cache.get(&i) {
+                let th = Rc::new(codec::thumb(img, 360));
+                self.page_thumbs.insert(i, th.clone());
+                return Some(Rc::new(peek::Peek::Img((*th).clone())));
+            }
+            if let (Some(pg), Some((k, job))) = (&self.pager, self.page_job(i, 300.0)) {
+                pg.want(i, k, p.rot, job);
+            }
+            return None;
+        }
         let dpi = p.size_pt().map(|s| (300.0 / (s.0 / 72.0)).clamp(12.0, 96.0)).unwrap_or(30.0);
         let img = doc::render(&p, dpi).ok()?;
         let th = Rc::new(codec::thumb(&img, 360));
@@ -1314,7 +1577,7 @@ impl App {
             }
             let Some(nb) = self.neighbor(d) else { continue };
             let hover = self.peek_hover == d as i8;
-            let wide = hover && self.mode() != Mode2::Text;
+            let wide = hover && self.peek_can_widen();
             let ext = if wide { ui.s(150) } else { strip.right - strip.left };
             let s = if d < 0 { RECT { right: strip.left + ext, ..strip } } else { RECT { left: strip.right - ext, ..strip } };
             let (pk, kind, name) = match &nb {
@@ -1358,8 +1621,13 @@ impl App {
         }
     }
 
+    /// Хвостик выезжает поверх содержимого — кроме текста и видео (их окна сверху).
+    fn peek_can_widen(&self) -> bool {
+        !(self.mode() == Mode2::Text || (self.mode() == Mode2::Media && self.kind == Some(FK::Video)))
+    }
+
     fn peek_at(&self, x: i32, y: i32) -> i8 {
-        let wide = self.mode() != Mode2::Text;
+        let wide = self.peek_can_widen();
         let grow = if wide { self.s(150) } else { 0 };
         let l = if self.peek_hover == -1 && wide { RECT { right: self.peek_l.left + grow, ..self.peek_l } } else { self.peek_l };
         let r = if self.peek_hover == 1 && wide { RECT { left: self.peek_r.right - grow, ..self.peek_r } } else { self.peek_r };
@@ -1375,8 +1643,21 @@ impl App {
     // ------------------------------------------------------------ команды ---
     fn command(&mut self, id: u32) -> bool {
         // правки картинки — только в постраничном виде
-        if self.scrolling() && matches!(id, ID_FLIP | ID_FLIP_V | ID_CROP | ID_BR_UP | ID_BR_DN | ID_CO_UP | ID_CO_DN | ID_SA_UP | ID_SA_DN | ID_GRAY | ID_RS_50 | ID_RS_1920 | ID_COPY) {
+        if self.scrolling() && (matches!(id, ID_FLIP | ID_FLIP_V | ID_CROP | ID_BR_UP | ID_BR_DN | ID_CO_UP | ID_CO_DN | ID_SA_UP | ID_SA_DN | ID_GRAY | ID_RS_50 | ID_RS_1920 | ID_COPY) || (400..500).contains(&id)) {
             self.set_scroll(false);
+        }
+        if matches!(id, ID_FLIP | ID_FLIP_V | ID_ROT_L | ID_ROT_R | ID_CROP | ID_BR_UP | ID_BR_DN | ID_CO_UP | ID_CO_DN | ID_SA_UP | ID_SA_DN | ID_GRAY | ID_RS_50 | ID_RS_1920 | ID_COPY | ID_PRINT) || (400..500).contains(&id) {
+            self.ensure_full_view();
+        }
+        if matches!(id, ID_FLIP | ID_FLIP_V | ID_ROT_L | ID_ROT_R) {
+            self.commit_pending();
+            self.clear_sel();
+        }
+        if matches!(id, ID_COLLAGE | ID_CANVAS | ID_MERGE | ID_CONVERT | ID_INSERT | ID_DEL_PAGE | ID_MOVE_L | ID_MOVE_R | ID_SCROLL | ID_CLOSE_FILE) {
+            self.commit_pending();
+        }
+        if self.editor_command(id) {
+            return true;
         }
         match id {
             ID_OPEN => self.open(),
@@ -1413,9 +1694,13 @@ impl App {
                     }
                 }
                 _ => {
-                    if let Some(v) = &self.view {
-                        if clip::set_image(self.hwnd, v) {
-                            self.set_status("Картинка скопирована");
+                    self.commit_pending();
+                    if let Some(v) = self.view.clone() {
+                        // есть выделение — копируем его рамку
+                        let part = self.ed.sel.as_ref().and_then(|s| s.bbox()).map(|b| v.crop(b.0, b.1, b.2, b.3));
+                        let what = if part.is_some() { "Выделенное скопировано" } else { "Картинка скопирована" };
+                        if clip::set_image(self.hwnd, part.as_ref().unwrap_or(&v)) {
+                            self.set_status(what);
                         }
                     }
                 }
@@ -1485,6 +1770,7 @@ impl App {
             ID_MOVE_L => self.move_page(-1),
             ID_MOVE_R => self.move_page(1),
             ID_COLLAGE => self.collage(),
+            ID_CANVAS => self.canvas_open(vec![], false),
             ID_MERGE => self.merge(),
             ID_CONVERT => self.convert(),
             ID_FIND => {
@@ -1584,8 +1870,21 @@ impl App {
                 false,
             ),
             t if (ID_TAB0..ID_TAB0 + TABS.len() as u32).contains(&t) => {
-                self.tab = (t - ID_TAB0) as usize;
-                settings::set_i("tab", self.tab as i32);
+                let new = (t - ID_TAB0) as usize;
+                if new == TAB_DRAW && !matches!(self.ed.tool, ETool::Draw(_)) {
+                    if self.scrolling() {
+                        self.set_scroll(false);
+                    }
+                    if self.can_edit() {
+                        self.set_tool(ETool::Draw(crate::draw::Tool::Pen));
+                    }
+                } else if new != TAB_DRAW && matches!(self.ed.tool, ETool::Draw(_)) {
+                    self.set_tool(ETool::None);
+                }
+                self.tab = new;
+                if new != TAB_DRAW {
+                    settings::set_i("tab", self.tab.min(4) as i32);
+                }
             }
             s if (crate::table::ID_SHEET0..crate::table::ID_SHEET0 + 64).contains(&s) => {
                 if let Viewer::Table(t) = &mut self.viewer {
@@ -1604,7 +1903,7 @@ impl App {
             Mode2::Pages => {
                 let mut v = vec![0];
                 if self.pages.iter().any(|p| !p.is_docpage() || p.img.is_some()) || self.pages.len() == 1 {
-                    v.push(1);
+                    v.extend([1, TAB_DRAW]);
                 }
                 v.extend([2, 3, 4]);
                 v
@@ -1691,23 +1990,41 @@ impl App {
                 b(ID_COPY, IC_COPY, "Копировать", "Копировать картинку (Ctrl+C)"),
                 b(ID_PASTE, IC_PASTE, "Вставить", "Вставить картинку или файлы из буфера (Ctrl+V)"),
             ],
-            (1, _) => vec![
-                b(ID_BR_UP, IC_SUN, "Ярче", "Яркость +10%"),
-                b(ID_BR_DN, IC_SUN, "Темнее", "Яркость −10%"),
-                s,
-                b(ID_CO_UP, IC_CONTRAST, "Контраст +", "Контраст +10%"),
-                b(ID_CO_DN, IC_CONTRAST, "Контраст −", "Контраст −10%"),
-                s,
-                b(ID_SA_UP, IC_COLOR, "Насыщ. +", "Насыщенность +20%"),
-                b(ID_SA_DN, IC_COLOR, "Насыщ. −", "Насыщенность −20%"),
-                b(ID_GRAY, IC_COLOR, "Ч/Б", "Сделать чёрно-белым"),
-                s,
-                b(ID_RS_50, IC_PICTURE, "Размер ½", "Уменьшить вдвое"),
-                b(ID_RS_1920, IC_FULLSCREEN, "1920 px", "1920 точек по ширине"),
-                s,
-                b(ID_FLIP_V, IC_FLIP, "Отразить ↕", "Отразить по вертикали"),
-                b(ID_UNDO, IC_UNDO, "Отменить", "Отменить (Ctrl+Z)"),
-            ],
+            (1, _) => {
+                let mut v = vec![
+                    b(ID_T_RECT, 0xE739, "Рамка", "Выделить прямоугольник (Shift — добавить, Alt — вычесть)"),
+                    b(ID_T_ELL, 0xEA3A, "Овал", "Выделить овал"),
+                    b(ID_T_LASSO, 0xE76D, "Лассо", "Обвести область от руки"),
+                    b(ID_T_WAND, 0xE793, "Палочка", "Выделить область похожего цвета одним щелчком"),
+                    b(ID_SEL_INV, 0xE8EB, "Обратить", "Выделить всё, кроме выделенного (например, фон)"),
+                    s,
+                    b(ID_ADJ, 0xE706, "Настройка", "Яркость, экспозиция, контраст, тени, теплота, резкость… — ползунками"),
+                    s,
+                ];
+                for (k, fx) in FX.iter().enumerate() {
+                    v.push(b(ID_FX0 + k as u32, fx.2, fx.1, fx.3));
+                }
+                v.extend([
+                    s,
+                    b(ID_CROP, IC_CROP, "Обрезать", "Обрезка с пропорциями 1:1, 4:3, 16:9… (по выделению — сразу)"),
+                    b(ID_RESIZE, 0xE799, "Размер и формат", "Размер в точках или %, тип файла, качество, DPI (Ctrl+Shift+R)"),
+                    b(ID_FLIP_V, IC_FLIP, "Отразить ↕", "Отразить по вертикали"),
+                    b(ID_UNDO, IC_UNDO, "Отменить", "Отменить (Ctrl+Z)"),
+                ]);
+                v
+            }
+            (TAB_DRAW, _) => {
+                let mut v: Vec<Option<Rb>> = vec![];
+                let icons = [0xE70F, 0xE7E6, 0xE75C, 0xE738, 0xE72A, 0xE739, 0xEA3A, 0xE8D2];
+                for (k, (_, name, tip)) in crate::draw::TOOLS.iter().enumerate() {
+                    v.push(b(ID_D0 + k as u32, icons[k], name, tip));
+                    if k == 2 {
+                        v.push(s);
+                    }
+                }
+                v.extend([s, b(ID_UNDO, IC_UNDO, "Отменить", "Отменить штрих (Ctrl+Z)")]);
+                v
+            }
             (2, _) => vec![
                 b(ID_INSERT, IC_ADD, "Вставить", "Вставить фото или страницы PDF после текущей (Ctrl+I)"),
                 b(ID_DEL_PAGE, IC_DELETE, "Удалить", "Удалить текущую страницу (Delete)"),
@@ -1721,7 +2038,8 @@ impl App {
                 b(ID_MERGE, IC_MERGE, "Объединить", "Объединить файлы в один PDF (Ctrl+M)"),
             ],
             (3, _) => vec![
-                b(ID_COLLAGE, IC_GRID, "Коллаж", "Склеить несколько фото в одно (Ctrl+G)"),
+                b(ID_CANVAS, IC_PICTURE, "Холст", "Чистый лист: рисовать, класть фото, крутить и двигать их (Ctrl+N)"),
+                b(ID_COLLAGE, IC_GRID, "Коллаж", "Открытые фото — на холст по шаблону; дальше двигайте как угодно (Ctrl+G)"),
                 b(ID_MERGE, IC_MERGE, "Объединить в PDF", "Фото, PDF и документы → один PDF (Ctrl+M)"),
                 b(ID_CONVERT, IC_CONVERT, "Конвертировать", "Фото, аудио, видео → другой формат; сразу много файлов (Ctrl+E)"),
                 s,
@@ -1769,7 +2087,7 @@ impl App {
         let multi = self.pages.len() > 1;
         let can_rot = has || self.pages.get(self.cur).map(|p| p.is_docpage() && p.img.is_none()).unwrap_or(false);
         match id {
-            ID_OPEN | ID_KEYS | ID_ABOUT | ID_COLLAGE | ID_MERGE | ID_CONVERT | ID_INSERT | ID_FULL | ID_MORE | ID_WORK => true,
+            ID_OPEN | ID_KEYS | ID_ABOUT | ID_COLLAGE | ID_CANVAS | ID_MERGE | ID_CONVERT | ID_INSERT | ID_FULL | ID_MORE | ID_WORK => true,
             ID_THEME_SYS | ID_THEME_LIGHT | ID_THEME_DARK | ID_BOOK | ID_SCROLL | ID_CLOSE_FILE => true,
             ID_PASTE => matches!(self.mode(), Mode2::Pages | Mode2::Empty),
             ID_UNDO => match &self.viewer {
@@ -1785,10 +2103,10 @@ impl App {
             ID_UNSORT => matches!(&self.viewer, Viewer::Table(t) if t.sort.is_some()),
             ID_COPY | ID_COPY_ROW => match &self.viewer {
                 Viewer::Table(t) => t.sel.is_some(),
-                Viewer::Media(m) => m.frame.is_some(),
+                Viewer::Media(m) => m.native.0 > 0,
                 _ => has,
             },
-            ID_FRAME => matches!(&self.viewer, Viewer::Media(m) if m.frame.is_some()),
+            ID_FRAME => matches!(&self.viewer, Viewer::Media(m) if m.native.0 > 0),
             ID_ZIN | ID_ZOUT | ID_FIT | ID_100 => has || matches!(self.mode(), Mode2::Table | Mode2::Text),
             _ => has || !self.viewer_is_none(),
         }
@@ -1802,6 +2120,12 @@ impl App {
             ID_CROP => self.crop_mode,
             ID_FULL => self.full.is_some(),
             ID_WORK => self.work,
+            ID_ADJ => self.ed.adj_open,
+            ID_T_RECT => self.ed.tool == ETool::Sel(SelShape::Rect),
+            ID_T_ELL => self.ed.tool == ETool::Sel(SelShape::Ellipse),
+            ID_T_LASSO => self.ed.tool == ETool::Sel(SelShape::Lasso),
+            ID_T_WAND => self.ed.tool == ETool::Sel(SelShape::Wand),
+            d if (ID_D0..ID_D0 + crate::draw::TOOLS.len() as u32).contains(&d) => self.ed.tool == ETool::Draw(crate::draw::TOOLS[(d - ID_D0) as usize].0),
             ID_BOOK => !self.scroll_mode,
             ID_SCROLL => self.scroll_mode,
             ID_HEADER => matches!(&self.viewer, Viewer::Table(t) if t.header),
@@ -1913,7 +2237,10 @@ Ctrl+O — открыть (можно несколько файлов)\nCtrl+S �
 Ctrl+P — печать\nCtrl+C / Ctrl+V — копировать / вставить\nCtrl+W — закрыть файл\nCtrl+E — конвертация\n\n\
 Home / End — первая / последняя страница (в работе)\nCtrl+I — вставить фото/страницы\nDelete — удалить страницу\n\
 Ctrl+L / Ctrl+R — повернуть\nCtrl+H — отразить (в тексте — замена)\nCtrl+K — обрезка (Enter — применить, Esc — отмена)\n\
-Ctrl+Z — отменить\nCtrl+G — коллаж\nCtrl+M — объединить в PDF\n\n\
+Ctrl+Z — отменить\nCtrl+N — холст (рисовать, класть фото)\nCtrl+G — коллаж из открытых фото\nCtrl+M — объединить в PDF\n\n\
+Правка фото: Ctrl+A — выделить всё, Ctrl+D — снять, Shift/Alt — добавить/вычесть,\n\
+   Delete — залить выделенное белым, Ctrl+Shift+R — размер и формат\n\
+Рисование: Shift — ровно (45°, квадрат, круг), Ctrl+Z — штрих назад, Esc — готово\n\n\
 Текст: Ctrl+F — найти, F3 — далее, Ctrl+H — заменить\n\
 Медиа: пробел — пуск/пауза, Shift+← → — 5 с, ↑ ↓ — громкость, M — звук\n\
 Таблица: щелчок по заголовку — сортировка ▲ ▼ (файл не меняется)\n\n\
@@ -1936,6 +2263,7 @@ impl Panel for App {
         self.hwnd = hwnd;
         self.dpi = gui::dpi_of(hwnd);
         self.peeker = Some(Peeker::new(hwnd));
+        self.pager = Some(crate::pager::Pager::new(hwnd));
         unsafe {
             DragAcceptFiles(hwnd, true);
             SetTimer(hwnd, TIMER_START, 1, None);
@@ -1957,6 +2285,11 @@ impl Panel for App {
             self.peek_l = RECT::default();
             self.peek_r = RECT::default();
             self.layout_viewer(ui, &mut v);
+            // мышь у верхнего края — кнопка «выйти из полного экрана»
+            if self.full_hover {
+                let bw = ui.s(130);
+                v.push(W::new(Kind::Button, ID_FULL, gui::r(w - ui.s(12) - bw, ui.s(12), bw, ui.s(36))).i(gui::IC_FIT).t("Выйти (Esc)").tip("Выйти из полноэкранного режима (Esc, F11)"));
+            }
             return v;
         }
         let tab_h = ui.s(38);
@@ -1973,6 +2306,9 @@ impl Panel for App {
         if self.work {
             self.canvas.top += ui.s(3); // место под полосу «режим работы»
         }
+        // полоса инструментов редактора сверху и панель «Настройка» справа
+        self.canvas.top += self.tool_bar_h(ui);
+        self.canvas.right -= self.adj_panel_w(ui);
 
         // вкладки — только нужные этому типу файла
         let tabs = self.tabs();
@@ -1985,13 +2321,8 @@ impl Panel for App {
             x += tw + ui.s(2);
         }
         let b = ui.s(34);
-        let mode_icon = match theme::mode() {
-            Mode::System => gui::IC_MONITOR,
-            Mode::Light => gui::IC_SUN,
-            Mode::Dark => gui::IC_MOON,
-        };
         v.push(W::new(Kind::Tool, ID_KEYS, gui::r(w - ui.s(8) - b, ui.s(3), b, b)).i(gui::IC_HELP).tip("Горячие клавиши (F1)"));
-        v.push(W::new(Kind::Tool, ID_THEME_CYCLE, gui::r(w - ui.s(12) - 2 * b, ui.s(3), b, b)).i(mode_icon).tip("Сменить тему: светлая / тёмная"));
+        v.push(W::new(Kind::Tool, ID_FULL, gui::r(w - ui.s(12) - 2 * b, ui.s(3), b, b)).i(gui::IC_FULLSCREEN).tip("Во весь экран (F11). Тема — во вкладке «Вид»"));
 
         // лента: подписи → только значки → «ещё…»
         let items = self.ribbon(tab);
@@ -2140,6 +2471,7 @@ impl Panel for App {
             v.push(W::new(Kind::Button, ID_OPEN, gui::r(cx - bw / 2, cy + ui.s(10), bw, ui.s(38))).t("Открыть файл…").i(gui::IC_OPEN).on(true));
             v.push(W::new(Kind::Button, ID_PASTE, gui::r(cx - bw / 2, cy + ui.s(56), bw, ui.s(34))).t("Вставить из буфера").i(gui::IC_PASTE));
         }
+        self.layout_editor(ui, &mut v);
         self.layout_viewer(ui, &mut v);
         v
     }
@@ -2166,6 +2498,7 @@ impl Panel for App {
             // режим работы — тонкая полоса акцентного цвета над холстом
             gui::fill(hdc, &gui::r(a.left, a.top, a.right - a.left, ui.s(3)), t.accent);
         }
+        self.paint_editor_back(ui, hdc);
         unsafe {
             let _ = IntersectClipRect(hdc, c.left, c.top, c.right, c.bottom);
         }
@@ -2184,7 +2517,7 @@ impl Panel for App {
             }
         }
         // хвостик при наведении — поверх содержимого (кроме текста: там редактор)
-        if self.peek_hover != 0 && self.full.is_none() && self.mode() != Mode2::Text {
+        if self.peek_hover != 0 && self.full.is_none() && self.peek_can_widen() {
             unsafe {
                 let _ = SelectClipRgn(hdc, None);
             }
@@ -2196,8 +2529,14 @@ impl Panel for App {
     }
 
     fn event(&mut self, _hwnd: HWND, ev: Ev) -> bool {
-        if let Ev::Click(id) = ev {
-            self.command(id);
+        match ev {
+            Ev::Click(id) => {
+                self.command(id);
+            }
+            Ev::Slide(id, v) => {
+                self.editor_slide(id, v);
+            }
+            _ => {}
         }
         true
     }
@@ -2215,6 +2554,7 @@ impl Panel for App {
                 0x57 => ID_CLOSE_FILE,
                 0x45 => ID_CONVERT,
                 0x47 => ID_COLLAGE,
+                0x4E => ID_CANVAS,
                 0x4D => ID_MERGE,
                 0x21 => ID_PREV,
                 0x22 => ID_NEXT,
@@ -2363,11 +2703,15 @@ impl Panel for App {
             }
             Viewer::None => {}
         }
+        if let Some(r) = self.editor_key(vk, ctrl) {
+            return Some(r);
+        }
         let scrolling = self.scrolling();
         let id = if ctrl {
             match vk {
                 0x5A => ID_UNDO,
                 0x4C => ID_ROT_L,
+                0x52 if shift => ID_RESIZE,
                 0x52 => ID_ROT_R,
                 0x48 => ID_FLIP,
                 0x4B => ID_CROP,
@@ -2429,6 +2773,9 @@ impl Panel for App {
         if self.peek_at(x, y) != 0 {
             return Some(IDC_HAND);
         }
+        if let Some(c) = self.editor_cursor(x, y) {
+            return Some(c);
+        }
         if let Viewer::Table(t) = &self.viewer {
             return t.cursor(&Ui::new(self.dpi), x, y);
         }
@@ -2444,6 +2791,17 @@ impl Panel for App {
     }
 
     fn mouse(&mut self, hwnd: HWND, m: Mouse, x: i32, y: i32) -> bool {
+        let full_changed = if self.full.is_some() && m == Mouse::Move {
+            let near = y < self.s(70);
+            let ch = near != self.full_hover;
+            self.full_hover = near;
+            ch
+        } else {
+            false
+        };
+        if full_changed && self.drag.is_none() {
+            return true;
+        }
         // хвостики
         let ph = self.peek_at(x, y);
         let hover_changed = ph != self.peek_hover && self.drag.is_none();
@@ -2488,6 +2846,9 @@ impl Panel for App {
             }
             Viewer::Text(_) => return hover_changed,
             Viewer::None => {}
+        }
+        if let Some(r) = self.editor_mouse(m, cx, cy, in_canvas) {
+            return r || hover_changed;
         }
         let has = self.view.is_some() || self.scrolling();
         match m {
@@ -2642,6 +3003,10 @@ impl Panel for App {
                 }
                 Some(LRESULT(0))
             }
+            crate::pager::WM_PAGE => {
+                self.pages_ready();
+                Some(LRESULT(0))
+            }
             WM_PEEK => {
                 if let Some(p) = &mut self.peeker {
                     p.poll();
@@ -2649,9 +3014,20 @@ impl Panel for App {
                 Some(LRESULT(0))
             }
             WM_TEXT_REFRESH => Some(LRESULT(0)),
+            WM_TEXT_COMMIT => {
+                self.commit_text();
+                Some(LRESULT(0))
+            }
             WM_COMMAND => {
                 let code = (wp.0 >> 16) as u32 & 0xFFFF;
                 let id = wp.0 as u32 & 0xFFFF;
+                if id == 1101 && code == 0x0200 {
+                    // поле текста потеряло фокус — «впечатать» надпись (после выхода из уведомления)
+                    unsafe {
+                        let _ = PostMessageW(self.hwnd, WM_TEXT_COMMIT, WPARAM(0), LPARAM(0));
+                    }
+                    return Some(LRESULT(0));
+                }
                 if id == textview::ID_EDIT && code == 0x0100 && !self.work && matches!(self.viewer, Viewer::Text(_)) {
                     // щелчок по тексту в обзоре — начать правку
                     self.set_work(true);
@@ -2686,6 +3062,7 @@ impl Panel for App {
                 }
                 None
             }
+            WM_CTLCOLOREDIT if self.is_text_box(HWND(lp.0 as *mut _)) => self.text_ctl_color(HDC(wp.0 as *mut _), HWND(lp.0 as *mut _)),
             WM_CTLCOLOREDIT => {
                 let t = theme::cur();
                 if let Viewer::Text(tv) = &self.viewer {
@@ -2716,6 +3093,7 @@ impl App {
         match &mut self.viewer {
             Viewer::Table(t) => v.extend(t.widgets(ui, c)),
             Viewer::Text(t) => v.extend(t.layout(ui, c)),
+            Viewer::Media(m) => m.place(ui, c),
             _ => {}
         }
     }
@@ -2790,6 +3168,12 @@ impl App {
                 }
             }
         }
+        // предпросмотр «Настройки» — поверх, в той же рамке
+        if let Some(pv) = self.ed.preview.clone() {
+            let rc = gui::r(c.left + dx.round() as i32, c.top + dy.round() as i32, dw.round() as i32, dh.round() as i32);
+            gui::blit(hdc, &pv, &rc, self.hq);
+        }
+        self.paint_editor(ui, hdc);
         if let (true, Some((a, b, cc, d))) = (self.crop_mode, self.crop) {
             let rc = RECT {
                 left: c.left + a.min(cc) as i32,

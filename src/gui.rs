@@ -293,6 +293,7 @@ pub enum Kind {
     Group,  // заголовок раздела
     List,   // список
     Swatch, // образец цвета (кнопка)
+    Slider, // ползунок: val 0…1; align 1 — от середины (±)
 }
 
 #[derive(Clone)]
@@ -311,13 +312,14 @@ pub struct W {
     pub sel: Option<usize>,
     pub scroll: usize,
     pub color: Option<COLORREF>,
+    pub val: f64,
 }
 
 impl W {
     pub fn new(kind: Kind, id: u32, rc: RECT) -> W {
         W {
             id, kind, rc, text: String::new(), icon: 0, tip: String::new(), on: false, enabled: true,
-            wheel: None, align: 0, items: vec![], sel: None, scroll: 0, color: None,
+            wheel: None, align: 0, items: vec![], sel: None, scroll: 0, color: None, val: 0.0,
         }
     }
     pub fn t(mut self, s: impl Into<String>) -> W {
@@ -348,12 +350,16 @@ impl W {
         self.align = a;
         self
     }
+    pub fn v(mut self, v: f64) -> W {
+        self.val = v.clamp(0.0, 1.0);
+        self
+    }
     pub fn color(mut self, c: COLORREF) -> W {
         self.color = Some(c);
         self
     }
     fn clickable(&self) -> bool {
-        self.enabled && matches!(self.kind, Kind::Tab | Kind::Ribbon | Kind::Tool | Kind::Button | Kind::Seg | Kind::Check | Kind::List | Kind::Swatch)
+        self.enabled && matches!(self.kind, Kind::Tab | Kind::Ribbon | Kind::Tool | Kind::Button | Kind::Seg | Kind::Check | Kind::List | Kind::Swatch | Kind::Slider)
     }
 }
 
@@ -507,6 +513,22 @@ fn draw_w(ui: &Ui, hdc: HDC, w: &W, hover: bool, press: bool, hover_item: Option
                 round(hdc, &ring, rad, None, Some(t.accent));
             }
         }
+        Kind::Slider => {
+            let pad = ui.s(8);
+            let (x0, x1) = (rc.left + pad, rc.right - pad);
+            let cy = (rc.top + rc.bottom) / 2;
+            let x = x0 + ((x1 - x0) as f64 * w.val).round() as i32;
+            let th = ui.s(4);
+            let col = if w.enabled { t.accent } else { t.dim };
+            round(hdc, &r(x0, cy - th / 2, x1 - x0, th), th, Some(t.border), None);
+            let from = if w.align == 1 { (x0 + x1) / 2 } else { x0 };
+            let (a, b) = (from.min(x), from.max(x));
+            if b > a {
+                round(hdc, &r(a, cy - th / 2, b - a, th), th, Some(col), None);
+            }
+            let kr = if hover || press { ui.s(8) } else { ui.s(7) };
+            round(hdc, &r(x - kr, cy - kr, 2 * kr, 2 * kr), 2 * kr, Some(col), Some(t.card));
+        }
         Kind::List => {
             round(hdc, &rc, rad, Some(t.card), Some(t.border));
             let rh = list_row_h(ui, w);
@@ -561,6 +583,16 @@ pub enum Ev {
     Item(u32, usize),
     Dbl(u32, usize),
     Scroll(u32, i32),
+    /// Ползунок тянут: новое значение 0…1.
+    Slide(u32, f64),
+    /// Ползунок отпустили.
+    SlideEnd(u32),
+}
+
+/// Значение ползунка по координате мыши.
+pub fn slider_val(ui_dpi: u32, rc: &RECT, x: i32) -> f64 {
+    let pad = 8 * ui_dpi as i32 / 96;
+    ((x - rc.left - pad) as f64 / (rc.right - rc.left - 2 * pad).max(1) as f64).clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -626,6 +658,7 @@ struct St {
     hover: Option<usize>,
     hover_item: Option<usize>,
     press: Option<(u32, Kind)>,
+    slide: Option<RECT>,
     back: HBITMAP,
     bw: i32,
     bh: i32,
@@ -831,7 +864,60 @@ pub fn retheme_all() {
     }
 }
 
+/// Замер отзывчивости: SPV_TRACE=1 — в stderr сообщения окна дольше 25 мс
+/// и итог (сколько сообщений, самое долгое) при закрытии.
+pub mod trace {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    pub static COUNT: AtomicU64 = AtomicU64::new(0);
+    pub static SLOW: AtomicU64 = AtomicU64::new(0);
+    pub static MAX_US: AtomicU64 = AtomicU64::new(0);
+    pub static PAINT_US: AtomicU64 = AtomicU64::new(0);
+    pub static PAINTS: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SPV_TRACE").is_ok())
+    }
+    pub fn note(msg: u32, us: u64) {
+        COUNT.fetch_add(1, Relaxed);
+        MAX_US.fetch_max(us, Relaxed);
+        if msg == 0x000F {
+            PAINTS.fetch_add(1, Relaxed);
+            PAINT_US.fetch_add(us, Relaxed);
+        }
+        if us > 25_000 {
+            SLOW.fetch_add(1, Relaxed);
+            eprintln!("[trace] msg 0x{msg:04X}: {} ms", us / 1000);
+        }
+    }
+    pub fn report() {
+        if on() {
+            let (own, ws, gdi, user) = crate::bench::resources();
+            eprintln!("[trace] память: {own:.0} МБ своей, {ws:.0} МБ рабочий набор; объектов GDI {gdi}, USER {user}");
+            let p = PAINTS.load(Relaxed).max(1);
+            eprintln!(
+                "[trace] итог: сообщений {}, медленных (>25 мс) {}, самое долгое {} мс, перерисовок {}, в среднем {:.1} мс",
+                COUNT.load(Relaxed),
+                SLOW.load(Relaxed),
+                MAX_US.load(Relaxed) / 1000,
+                PAINTS.load(Relaxed),
+                PAINT_US.load(Relaxed) as f64 / p as f64 / 1000.0
+            );
+        }
+    }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if trace::on() {
+        let t = std::time::Instant::now();
+        let r = wndproc_in(hwnd, msg, wp, lp);
+        trace::note(msg, t.elapsed().as_micros() as u64);
+        return r;
+    }
+    wndproc_in(hwnd, msg, wp, lp)
+}
+
+fn wndproc_in(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_NCCREATE {
             let cs = &*(lp.0 as *const CREATESTRUCTW);
@@ -904,6 +990,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     }
                 }
                 set_hover(hwnd, h, x, y);
+                let sliding = h.st.try_borrow().ok().and_then(|st| st.press.filter(|p| p.1 == Kind::Slider).map(|p| (p.0, st.slide)));
+                if let Some((id, Some(rc))) = sliding {
+                    let v = slider_val(dpi_of(hwnd), &rc, x);
+                    dispatch(hwnd, h, |p| p.event(hwnd, Ev::Slide(id, v)));
+                    return LRESULT(0);
+                }
                 let (pressing, over) = h.st.try_borrow().map(|st| (st.press.is_some(), st.hover.is_some())).unwrap_or((true, true));
                 if !pressing {
                     if !over || GetCapture() == hwnd {
@@ -948,6 +1040,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                                 let ev = if msg == WM_LBUTTONDBLCLK { Ev::Dbl(w.id, k) } else { Ev::Item(w.id, k) };
                                 dispatch(hwnd, h, |p| p.event(hwnd, ev));
                             }
+                        } else if w.kind == Kind::Slider {
+                            if msg == WM_LBUTTONDBLCLK {
+                                // двойной щелчок по ползунку — сброс (событие Click)
+                                dispatch(hwnd, h, |p| p.event(hwnd, Ev::Click(w.id)));
+                            } else {
+                                if let Ok(mut st) = h.st.try_borrow_mut() {
+                                    st.press = Some((w.id, w.kind));
+                                    st.slide = Some(w.rc);
+                                }
+                                SetCapture(hwnd);
+                                let v = slider_val(dpi_of(hwnd), &w.rc, x);
+                                dispatch(hwnd, h, |p| p.event(hwnd, Ev::Slide(w.id, v)));
+                            }
                         } else if msg == WM_LBUTTONDBLCLK {
                             // быстрый второй щелчок по кнопке — ещё одно нажатие
                             dispatch(hwnd, h, |p| p.event(hwnd, Ev::Click(w.id)));
@@ -976,6 +1081,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 let pressed = h.st.try_borrow_mut().ok().and_then(|mut st| st.press.take());
                 set_hover(hwnd, h, x, y);
                 match pressed {
+                    Some((id, Kind::Slider)) => {
+                        dispatch(hwnd, h, |p| p.event(hwnd, Ev::SlideEnd(id)));
+                    }
                     Some((id, kind)) => {
                         let same = h
                             .st
@@ -1167,7 +1275,7 @@ pub fn create(owner: Option<HWND>, panel: Rc<RefCell<dyn Panel>>, size: (i32, i3
         let host = Box::new(Host {
             panel,
             st: RefCell::new(St {
-                ws: vec![], mouse: (-10000, -10000), hover: None, hover_item: None, press: None,
+                ws: vec![], mouse: (-10000, -10000), hover: None, hover_item: None, press: None, slide: None,
                 back: HBITMAP::default(), bw: 0, bh: 0, tip: false, tracking: false, title: title.clone(),
             }),
             owner: owner_h,
@@ -1228,7 +1336,9 @@ fn forward_key(msg: &MSG) -> bool {
         let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
         let mut cls = [0u16; 16];
         let n = GetClassNameW(msg.hwnd, &mut cls);
-        let is_edit = String::from_utf16_lossy(&cls[..n.max(0) as usize]).eq_ignore_ascii_case("Edit");
+        // однострочное поле: Enter — «готово» (в многострочном — новая строка)
+        let is_edit = String::from_utf16_lossy(&cls[..n.max(0) as usize]).eq_ignore_ascii_case("Edit")
+            && (GetWindowLongW(msg.hwnd, GWL_STYLE) & 0x0004 /* ES_MULTILINE */) == 0;
         let global = (ctrl && matches!(vk, 0x4F | 0x53 | 0x50 | 0x46 | 0x48 | 0x47 | 0x4D | 0x51 | 0x09 | 0x21 | 0x22 | 0x57))
             || matches!(vk, 0x70 | 0x72 | 0x7A)
             || (vk == VK_ESCAPE.0)

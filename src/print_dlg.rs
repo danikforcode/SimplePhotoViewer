@@ -30,6 +30,20 @@ const PAPERS: [(&str, i16, (f64, f64)); 5] = [
     ("Letter", 1, (215.9, 279.4)),
 ];
 const GAP_MM: f64 = 3.0;
+/// Другие форматы листа (книжная форма; ориентацию выбирает «Ориентация»).
+/// Последние два — особые: «по размеру фото» и «свой размер».
+const MORE_PAPERS: [(&str, (f64, f64), bool); 9] = [
+    ("Слайд 16:9 (338,7 × 190,5 мм)", (190.5, 338.7), true),
+    ("Слайд 4:3 (254 × 190,5 мм)", (190.5, 254.0), true),
+    ("Квадрат (210 × 210 мм)", (210.0, 210.0), false),
+    ("Фото 10 × 15 см", (100.0, 150.0), false),
+    ("Фото 13 × 18 см", (130.0, 180.0), false),
+    ("A6 (105 × 148 мм)", (105.0, 148.0), false),
+    ("A2 (420 × 594 мм)", (420.0, 594.0), false),
+    ("По размеру фото (без полей)", (0.0, 0.0), false),
+    ("Свой размер…", (0.0, 0.0), false),
+];
+const MENU_PAPER: u32 = 2000;
 
 const ID_PRINTER: u32 = 1;
 const ID_PROPS: u32 = 2;
@@ -277,6 +291,8 @@ struct PrintDlg {
     fill: bool,
     nup: usize,
     margin: i32,
+    /// Свой формат листа: название и размер в мм (книжная форма).
+    custom: Option<(String, (f64, f64))>,
     copies: i32,
     all: bool,
     autorot: bool,
@@ -554,6 +570,65 @@ impl PrintDlg {
         }
     }
 
+    fn is_custom(&self) -> bool {
+        self.paper >= PAPERS.len()
+    }
+
+    /// Размер листа в мм (книжная форма).
+    fn paper_mm(&self) -> (f64, f64) {
+        match (&self.custom, self.is_custom()) {
+            (Some((_, s)), true) => *s,
+            _ => PAPERS[self.paper.min(PAPERS.len() - 1)].2,
+        }
+    }
+
+    fn pick_paper(&mut self, hwnd: HWND) {
+        let items: Vec<(u32, String, bool)> = MORE_PAPERS
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (MENU_PAPER + i as u32, p.0.to_string(), self.is_custom() && self.custom.as_ref().map(|c| c.0 == p.0).unwrap_or(false)))
+            .collect();
+        let (x, y) = gui::mouse_pos(hwnd);
+        let r = gui::popup_menu(hwnd, x, y, &items);
+        if r < MENU_PAPER {
+            return;
+        }
+        let k = (r - MENU_PAPER) as usize;
+        let (name, size, slide) = MORE_PAPERS[k];
+        let size = match k {
+            7 => {
+                // по пропорциям первого фото: длинная сторона 297 мм
+                let a = self.aspect(self.sheets().first().and_then(|s| s.first().copied()).unwrap_or(0)).max(0.05);
+                let (w, h) = if a >= 1.0 { (297.0, 297.0 / a) } else { (297.0 * a, 297.0) };
+                self.margin = 0;
+                self.nup = 0;
+                self.orient = 0;
+                (w.min(h), w.max(h))
+            }
+            8 => {
+                let cur = self.paper_mm();
+                let land = self.orient == 2;
+                let init = if land { (cur.1, cur.0) } else { cur };
+                let Some((w, h)) = crate::resize_dlg::ask_size(hwnd, init) else { return };
+                self.orient = if w > h { 2 } else { 1 };
+                (w.min(h), w.max(h))
+            }
+            _ => {
+                if slide {
+                    self.orient = 2;
+                }
+                size
+            }
+        };
+        let label = if k == 8 { format!("Свой {:.0} × {:.0} мм", size.0, size.1) } else { name.to_string() };
+        settings::set_s("print_custom", &format!("{};{};{}", size.0, size.1, label));
+        self.custom = Some((label, size));
+        self.paper = PAPERS.len();
+        self.adj.clear();
+        self.sel = None;
+        self.reset_caps();
+    }
+
     /// DEVMODE с нашими настройками (ориентация, бумага, цвет, 1 копия).
     fn build_dm(&self, land: bool) -> Option<DevMode> {
         let mut dm = match &self.dm {
@@ -565,7 +640,14 @@ impl PrintDlg {
             (*p).dmFields |= DM_ORIENTATION | DM_COPIES;
             (*p).Anonymous1.Anonymous1.dmOrientation = if land { DMORIENT_LANDSCAPE as i16 } else { DMORIENT_PORTRAIT as i16 };
             (*p).Anonymous1.Anonymous1.dmCopies = 1;
-            if self.paper > 0 {
+            if self.is_custom() {
+                // свой размер: DMPAPER_USER, в десятых долях мм
+                let (w, h) = self.paper_mm();
+                (*p).dmFields |= DM_PAPERSIZE | DM_PAPERWIDTH | DM_PAPERLENGTH;
+                (*p).Anonymous1.Anonymous1.dmPaperSize = 256;
+                (*p).Anonymous1.Anonymous1.dmPaperWidth = (w * 10.0).round() as i16;
+                (*p).Anonymous1.Anonymous1.dmPaperLength = (h * 10.0).round() as i16;
+            } else if self.paper > 0 {
                 (*p).dmFields |= DM_PAPERSIZE;
                 (*p).Anonymous1.Anonymous1.dmPaperSize = PAPERS[self.paper].1;
             }
@@ -580,7 +662,7 @@ impl PrintDlg {
     /// Размер бумаги без обращения к драйверу (для отрисовки): кеш или размер из списка.
     fn caps_view(&self, land: bool) -> Caps {
         self.caps.get(&land).copied().unwrap_or_else(|| {
-            let (w, h) = PAPERS[self.paper].2;
+            let (w, h) = self.paper_mm();
             Caps { phys: if land { (h, w) } else { (w, h) }, off: (0.0, 0.0), dpi: (300.0, 300.0) }
         })
     }
@@ -591,6 +673,13 @@ impl PrintDlg {
     fn caps(&mut self, land: bool) -> Caps {
         if let Some(c) = self.caps.get(&land) {
             return *c;
+        }
+        if self.is_custom() {
+            // свой лист — ровно заданный размер (для PDF); принтеру уйдёт DMPAPER_USER
+            let (w, h) = self.paper_mm();
+            let c = Caps { phys: if land { (h, w) } else { (w, h) }, off: (0.0, 0.0), dpi: (300.0, 300.0) };
+            self.caps.insert(land, c);
+            return c;
         }
         let from_printer = self.printer().map(|s| s.to_string()).and_then(|name| {
             let mut dm = self.build_dm(land)?;
@@ -606,7 +695,7 @@ impl PrintDlg {
             }
         });
         let c = from_printer.unwrap_or_else(|| {
-            let (w, h) = PAPERS[self.paper].2;
+            let (w, h) = self.paper_mm();
             Caps { phys: if land { (h, w) } else { (w, h) }, off: (0.0, 0.0), dpi: (300.0, 300.0) }
         });
         self.caps.insert(land, c);
@@ -842,6 +931,12 @@ impl Panel for PrintDlg {
         group(&mut v, &mut y, "Бумага");
         let names: Vec<&str> = PAPERS.iter().map(|p| p.0).collect();
         v.extend(gui::segments(ui, x, y, pw, ID_PAPER0, &names, self.paper));
+        y += row + ui.s(4);
+        let more = match (&self.custom, self.is_custom()) {
+            (Some((n, _)), true) => format!("{n}  ▾"),
+            _ => "Другой формат: 16:9, 4:3, фото, свой…  ▾".to_string(),
+        };
+        v.push(W::new(Kind::Seg, ID_PAPER0 + PAPERS.len() as u32, gui::r(x, y, pw, row)).t(more).on(self.is_custom()).tip("Слайды 16:9 и 4:3, квадрат, фотоформаты, по размеру фото или свой размер в мм"));
         y += row + step;
 
         group(&mut v, &mut y, "Ориентация");
@@ -1173,6 +1268,7 @@ impl Panel for PrintDlg {
                     }
                 }
             }
+            i if i == ID_PAPER0 + PAPERS.len() as u32 => self.pick_paper(hwnd),
             i if (ID_PAPER0..ID_PAPER0 + PAPERS.len() as u32).contains(&i) => {
                 self.paper = (i - ID_PAPER0) as usize;
                 self.reset_caps();
@@ -1331,11 +1427,17 @@ pub fn run(owner: HWND, pages: Vec<Page>, cur: usize, view: Option<Rc<Img>>, nam
         printers,
         pi,
         dm: None,
-        paper: settings::get_i("print_paper", 0).clamp(0, PAPERS.len() as i32 - 1) as usize,
+        paper: settings::get_i("print_paper", 0).clamp(0, PAPERS.len() as i32) as usize,
         orient: settings::get_i("print_orient", 0).clamp(0, 2) as usize,
         fill: settings::get_i("print_fill", 0) == 1,
         nup: settings::get_i("print_nup", 0).clamp(0, NUPS.len() as i32 - 1) as usize,
         margin: settings::get_i("print_margin", 5).clamp(0, 50),
+        custom: settings::get_s("print_custom").and_then(|v| {
+            let mut it = v.splitn(3, ';');
+            let w = it.next()?.parse::<f64>().ok()?;
+            let h = it.next()?.parse::<f64>().ok()?;
+            Some((it.next().unwrap_or("Свой").to_string(), (w, h)))
+        }),
         copies: 1,
         all: true,
         autorot: settings::get_i("print_autorot", 1) == 1,
@@ -1353,6 +1455,9 @@ pub fn run(owner: HWND, pages: Vec<Page>, cur: usize, view: Option<Rc<Img>>, nam
         hover: None,
         view: (0.0, 0.0, 1.0),
     };
+    if d.is_custom() && d.custom.is_none() {
+        d.paper = 0;
+    }
     if let Some(v) = view {
         d.thumbs.insert(d.cur, Rc::new(codec::thumb(&v, 1000)));
     }

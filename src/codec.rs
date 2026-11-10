@@ -163,6 +163,11 @@ pub fn jpeg_quality() -> i32 {
     crate::settings::get_i("jpeg_quality", 92).clamp(10, 100)
 }
 
+thread_local! {
+    /// Разрешение (точек на дюйм), записываемое в файл; 0 — не трогать.
+    static SAVE_DPI: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
 fn encode_to(f: &IWICImagingFactory, img: &Img, stream: &IStream, container: &GUID, quality: i32) -> Result<()> {
     unsafe {
         let enc = f.CreateEncoder(container, std::ptr::null())?;
@@ -183,6 +188,10 @@ fn encode_to(f: &IWICImagingFactory, img: &Img, stream: &IStream, container: &GU
         }
         frame.Initialize(bag.as_ref())?;
         frame.SetSize(img.w, img.h)?;
+        let dpi = SAVE_DPI.with(|d| d.get());
+        if dpi > 0.0 {
+            let _ = frame.SetResolution(dpi, dpi);
+        }
         let bmp = f.CreateBitmapFromMemory(img.w, img.h, &GUID_WICPixelFormat32bppBGRA, img.w * 4, &img.px)?;
         if *container == GUID_ContainerFormatGif {
             // GIF — 256 цветов: строим палитру по картинке и переводим в индексы
@@ -212,9 +221,10 @@ pub fn encode_mem(img: &Img, ext: &str, quality: i32) -> Result<Vec<u8>> {
         let stream = CreateStreamOnHGlobal(None, true)?;
         encode_to(&f, img, &stream, &container_for(ext), quality)?;
         let hg = GetHGlobalFromStream(&stream)?;
-        // реальный размер данных — позиция потока после записи
+        // реальный размер данных — конец потока (не текущая позиция: TIFF и другие
+        // кодировщики под конец возвращаются в начало файла дописать заголовок)
         let mut len = 0u64;
-        stream.Seek(0, windows::Win32::System::Com::STREAM_SEEK_CUR, Some(&mut len))?;
+        stream.Seek(0, windows::Win32::System::Com::STREAM_SEEK_END, Some(&mut len))?;
         let len = len as usize;
         let n = GlobalSize(hg).min(len.max(1));
         let p = GlobalLock(hg) as *const u8;
@@ -253,6 +263,14 @@ pub fn save(img: &Img, path: &Path) -> Result<()> {
 }
 
 /// Сохранить с заданным качеством (для JPEG/JPEG XR/HEIF).
+/// Сохранить с качеством и разрешением (DPI) — для окна «Размер и формат».
+pub fn save_full(img: &Img, path: &Path, quality: i32, dpi: f64) -> Result<()> {
+    SAVE_DPI.with(|d| d.set(dpi));
+    let r = save_q(img, path, quality);
+    SAVE_DPI.with(|d| d.set(0.0));
+    r
+}
+
 pub fn save_q(img: &Img, path: &Path, quality: i32) -> Result<()> {
     let ext = crate::util::ext_lower(path);
     let data = if ext == "ico" { encode_ico(img)? } else { encode_mem(img, &ext, quality)? };
@@ -293,4 +311,27 @@ pub fn thumb(img: &Img, max: u32) -> Img {
     }
     let (w, h) = (((img.w as f64 * k).round() as u32).max(1), ((img.h as f64 * k).round() as u32).max(1));
     resize(img, w, h).unwrap_or_else(|_| img.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Каждый формат: записать в память → прочитать → тот же размер и цвет.
+    /// (Был сбой: TIFF обрезался — длину брали по позиции потока, а не по его концу.)
+    #[test]
+    fn encode_decode_roundtrip() {
+        init();
+        let mut img = Img::filled(173, 91, [20, 140, 230]);
+        img.px[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        for ext in ["jpg", "png", "bmp", "tif", "gif"] {
+            let data = encode_mem(&img, ext, 95).unwrap_or_else(|e| panic!("{ext}: {e}"));
+            let back = load_bytes(&data).unwrap_or_else(|e| panic!("{ext}: {e}"));
+            assert_eq!((back.w, back.h), (173, 91), "{ext}");
+            let k = ((50 * 173 + 80) * 4) as usize;
+            for c in 0..3 {
+                assert!((back.px[k + c] as i32 - img.px[k + c] as i32).abs() <= 12, "{ext}: {:?}", &back.px[k..k + 3]);
+            }
+        }
+    }
 }
