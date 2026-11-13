@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Настройки: простой файл «ключ=значение» в %APPDATA%\SimplePhotoViewer\settings.ini.
 
 use std::cell::RefCell;

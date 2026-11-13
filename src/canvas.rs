@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! «Холст» — как лист в Paint, только с фото-объектами: чистый холст нужного
 //! формата, на нём фото (двигать, крутить, менять размер, обрезать рамкой,
 //! порядок слоёв) и рисунок поверх (карандаш, фигуры, текст).
@@ -1168,8 +1168,7 @@ impl Panel for Canvas {
         if !self.changed || self.objs.is_empty() {
             return true;
         }
-        let r = unsafe { MessageBoxW(hwnd, w!("Закрыть холст? Сделанное не сохранится."), w!("Холст"), MB_YESNO | MB_ICONQUESTION) };
-        r == IDYES
+        crate::dialogs::confirm(Some(hwnd), "Холст", "Закрыть холст? Сделанное не сохранится.", "Закрыть", "Вернуться")
     }
 
     fn raw(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, _lp: LPARAM) -> Option<LRESULT> {

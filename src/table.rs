@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Таблицы: XLSX/XLSM/XLSB/XLS/ODS (calamine) и CSV/TSV (свой разбор).
 //! Только просмотр: сортировка по столбцу меняет порядок на экране, файл не трогаем.
 

@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Мини-набор «самонарисованных» элементов интерфейса на GDI.
 //!
 //! Почему не стандартные кнопки Windows: они не умеют тёмную тему. Здесь всё
@@ -98,6 +98,10 @@ pub struct Fonts {
     pub icon_big: HFONT,
     pub sym: HFONT,
     pub sym_big: HFONT,
+    /// Крупный заголовок (окно «О программе»).
+    pub title: HFONT,
+    /// Текст покрупнее для диалогов.
+    pub body: HFONT,
 }
 
 fn mkfont(px: i32, weight: i32, face: &str) -> HFONT {
@@ -126,6 +130,8 @@ fn fonts(dpi: u32) -> Rc<Fonts> {
             icon_big: mkfont(s(20), 400, "Segoe MDL2 Assets"),
             sym: mkfont(s(17), 400, "Segoe UI Symbol"),
             sym_big: mkfont(s(21), 400, "Segoe UI Symbol"),
+            title: mkfont(s(26), 600, "Segoe UI"),
+            body: mkfont(s(14), 400, "Segoe UI"),
         });
         v.push((dpi, f.clone()));
         f
@@ -160,6 +166,20 @@ impl Ui {
             SelectObject(self.mdc, old);
         }
         sz.cx
+    }
+    /// Высота текста с переносами по словам при ширине w.
+    pub fn th(&self, font: HFONT, s: &str, w: i32) -> i32 {
+        if s.is_empty() {
+            return 0;
+        }
+        let mut b: Vec<u16> = s.encode_utf16().collect();
+        let mut rc = RECT { left: 0, top: 0, right: w.max(1), bottom: 0 };
+        unsafe {
+            let old = SelectObject(self.mdc, font);
+            DrawTextW(self.mdc, &mut b, &mut rc, DRAW_TEXT_FORMAT((DT_WORDBREAK.0 | DT_CALCRECT.0 | DT_NOPREFIX.0) as u32));
+            SelectObject(self.mdc, old);
+        }
+        rc.bottom - rc.top
     }
 }
 
@@ -240,6 +260,8 @@ pub fn frame(hdc: HDC, rc: &RECT, c: COLORREF, style: PEN_STYLE) {
 pub const LEFT: u32 = (DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0) as u32;
 pub const CENTER: u32 = (DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0) as u32;
 pub const RIGHT: u32 = (DT_RIGHT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0) as u32;
+/// Абзац слева с переносами по словам.
+pub const PARA: u32 = (DT_LEFT.0 | DT_WORDBREAK.0 | DT_NOPREFIX.0) as u32;
 pub const WRAP: u32 = (DT_CENTER.0 | DT_WORDBREAK.0 | DT_NOPREFIX.0) as u32;
 
 pub fn text(hdc: HDC, s: &str, rc: &RECT, font: HFONT, c: COLORREF, flags: u32) {
@@ -639,6 +661,10 @@ pub trait Panel {
     /// Минимальный размер клиентской области (в «пикселях 100%»).
     fn min_size(&self) -> (i32, i32) {
         (480, 360)
+    }
+    /// Можно ли тянуть края и разворачивать (диалоги — нет).
+    fn resizable(&self) -> bool {
+        true
     }
     /// Сырые сообщения окна, которые не разбирает хозяин: WM_COMMAND/WM_NOTIFY
     /// от системных элементов, WM_CTLCOLOR*, WM_APP+n от фоновых потоков.
@@ -1257,7 +1283,11 @@ pub fn create(owner: Option<HWND>, panel: Rc<RefCell<dyn Panel>>, size: (i32, i3
     unsafe {
         let owner_h = owner.unwrap_or_default();
         let dpi = if owner.is_some() { dpi_of(owner_h) } else { GetDpiForSystem().max(96) };
-        let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+        let style = if panel.borrow().resizable() {
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN
+        } else {
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
+        };
         let ex = WINDOW_EX_STYLE(0);
         let mut rc = r(0, 0, size.0 * dpi as i32 / 96, size.1 * dpi as i32 / 96);
         let _ = AdjustWindowRectExForDpi(&mut rc, style, false, ex, dpi);
@@ -1297,6 +1327,12 @@ pub fn run_modal<P: Panel + 'static>(owner: HWND, p: P, size: (i32, i32)) -> P {
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = EnableWindow(owner, false);
+        // клавиатура — новому окну (Esc/Enter работают сразу, без щелчка)
+        let _ = SetForegroundWindow(hwnd);
+        let f = GetFocus();
+        if f != hwnd && !IsChild(hwnd, f).as_bool() {
+            let _ = SetFocus(hwnd);
+        }
         let mut msg = MSG::default();
         while IsWindow(hwnd).as_bool() {
             let r = GetMessageW(&mut msg, None, 0, 0).0;

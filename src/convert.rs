@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Пакетная конвертация: фото (WIC), аудио и видео (Media Foundation — кодеки
 //! Windows: H.264, AAC, MP3, WMA, FLAC). Работает в фоновом потоке.
 

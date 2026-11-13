@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Типы файлов: по расширению решаем, каким просмотрщиком открыть файл.
 
 use std::path::Path;
@@ -35,6 +35,11 @@ pub const TEXT: &[&str] = &[
     "java", "kt", "kts", "go", "rb", "php", "pl", "lua", "sql", "sh", "bash", "zsh", "ps1", "psm1", "psd1", "bat", "cmd",
     "gradle", "cmake", "swift", "dart", "r", "m", "asm", "s", "srt", "vtt", "gitignore", "gitattributes", "editorconfig", "lock",
 ];
+/// RAW камер (для них — встроенный JPEG, если системного кодека нет).
+pub fn is_raw_ext(ext: &str) -> bool {
+    crate::extcodec::is_raw_ext(ext)
+}
+
 /// Файлы без расширения, которые тоже текст.
 const TEXT_NAMES: &[&str] = &["makefile", "dockerfile", "license", "readme", "changelog", "cmakelists.txt"];
 

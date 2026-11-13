@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Аудио и видео: системный Media Engine (кодеки Windows). Кадры видео
 //! передаются через Direct3D 11 и рисуются на общем холсте; для аудио —
 //! волна звука. Плюс миниатюры (первый кадр, волна) для «хвостиков».
@@ -231,6 +231,8 @@ pub struct MediaView {
     seeking: bool,
     hover_x: Option<i32>,
     bar_px: i32,
+    /// Свой проигрыватель HEVC (когда в системе нет кодека).
+    soft: Option<crate::softvideo::SoftPlayer>,
 }
 
 impl Drop for MediaView {
@@ -268,9 +270,24 @@ impl MediaView {
             path: path.to_path_buf(), engine: None, d3d: None, out: None, native: (0, 0), is_video, ready: false, error: None,
             duration: 0.0, pos: 0.0, playing: false, volume: crate::settings::get_i("volume", 80) as f64 / 100.0,
             muted: false, looped: false, rate: 1.0, wave: None, wave_rx: None, meta: String::new(),
-            seek_rect: RECT::default(), seeking: false, hover_x: None, bar_px: 0,
+            seek_rect: RECT::default(), seeking: false, hover_x: None, bar_px: 0, soft: None,
         };
         v.meta = describe(path);
+        // HEVC без системного кодека — свой проигрыватель
+        if is_video && crate::softvideo::needed(path) {
+            match crate::softvideo::SoftPlayer::open(hwnd, path, v.volume) {
+                Ok(p) => {
+                    v.duration = p.duration;
+                    v.native = p.native;
+                    v.ready = true;
+                    v.playing = true;
+                    v.meta = format!("{}  ·  HEVC — встроенный декодер", v.meta);
+                    v.soft = Some(p);
+                    return v;
+                }
+                Err(e) => v.error = Some(format!("HEVC: {e}")),
+            }
+        }
         if let Err(e) = v.create(hwnd) {
             v.error = Some(e);
         }
@@ -337,6 +354,11 @@ impl MediaView {
     /// Разместить окно-экран видео (rc — весь холст; снизу остаётся полоса перемотки).
     pub fn place(&mut self, ui: &Ui, rc: RECT) {
         self.bar_px = ui.s(44);
+        if let Some(p) = &mut self.soft {
+            let area = RECT { bottom: (rc.bottom - self.bar_px).max(rc.top + 1), ..rc };
+            p.place(area, self.error.is_none());
+            return;
+        }
         let Some(o) = &mut self.out else { return };
         let area = RECT { bottom: (rc.bottom - self.bar_px).max(rc.top + 1), ..rc };
         let show = self.is_video && self.error.is_none();
@@ -397,6 +419,30 @@ impl MediaView {
                 changed = true;
             }
         }
+        if let Some(sp) = &mut self.soft {
+            if sp.ended() && self.looped {
+                sp.seek(0.0);
+                sp.set_playing(true);
+            }
+            let p = sp.pos();
+            let track = (self.seek_rect.right - self.seek_rect.left).max(100) as f64;
+            let px = if self.duration > 0.0 { (p - self.pos).abs() / self.duration * track } else { 0.0 };
+            if px >= 1.0 || p.floor() != self.pos.floor() {
+                self.pos = p;
+                changed = true;
+            }
+            if sp.playing() != self.playing {
+                self.playing = sp.playing();
+                changed = true;
+            }
+            if let Some(e) = sp.error() {
+                if self.error.is_none() {
+                    self.error = Some(e);
+                    changed = true;
+                }
+            }
+            return changed;
+        }
         let Some(e) = self.engine.clone() else { return changed };
         unsafe {
             let p = e.GetCurrentTime();
@@ -424,6 +470,12 @@ impl MediaView {
     }
 
     pub fn toggle_play(&mut self) {
+        if let Some(p) = &mut self.soft {
+            let on = !p.playing();
+            p.set_playing(on);
+            self.playing = on;
+            return;
+        }
         let Some(e) = &self.engine else { return };
         unsafe {
             if e.IsPaused().as_bool() || e.IsEnded().as_bool() {
@@ -440,6 +492,10 @@ impl MediaView {
     }
 
     pub fn pause(&mut self) {
+        if let Some(p) = &mut self.soft {
+            p.set_playing(false);
+            self.playing = false;
+        }
         if let Some(e) = &self.engine {
             unsafe {
                 let _ = e.Pause();
@@ -449,6 +505,12 @@ impl MediaView {
     }
 
     pub fn seek(&mut self, t: f64) {
+        if let Some(p) = &mut self.soft {
+            let t = t.clamp(0.0, self.duration.max(0.0));
+            p.seek(t);
+            self.pos = t;
+            return;
+        }
         if let Some(e) = &self.engine {
             let t = t.clamp(0.0, self.duration.max(0.0));
             unsafe {
@@ -465,6 +527,9 @@ impl MediaView {
     pub fn set_volume(&mut self, v: f64) {
         self.volume = v.clamp(0.0, 1.0);
         crate::settings::set_i("volume", (self.volume * 100.0).round() as i32);
+        if let Some(p) = &self.soft {
+            p.set_volume(if self.muted { 0.0 } else { self.volume });
+        }
         if let Some(e) = &self.engine {
             unsafe {
                 let _ = e.SetVolume(self.volume);
@@ -474,6 +539,9 @@ impl MediaView {
 
     pub fn toggle_mute(&mut self) {
         self.muted = !self.muted;
+        if let Some(p) = &self.soft {
+            p.set_volume(if self.muted { 0.0 } else { self.volume });
+        }
         if let Some(e) = &self.engine {
             unsafe {
                 let _ = e.SetMuted(self.muted);
@@ -492,6 +560,9 @@ impl MediaView {
 
     pub fn cycle_rate(&mut self) {
         const R: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+        if self.soft.is_some() {
+            return; // свой проигрыватель — только обычная скорость
+        }
         let i = R.iter().position(|r| (*r - self.rate).abs() < 0.01).unwrap_or(2);
         self.rate = R[(i + 1) % R.len()];
         if let Some(e) = &self.engine {
@@ -509,6 +580,15 @@ impl MediaView {
         }
         if (self.rate - 1.0).abs() > 0.01 {
             v.push(format!("×{}", self.rate));
+        }
+        if let Some(p) = &self.soft {
+            let (dec, drop) = p.stats();
+            if drop > 0 && dec > 0 {
+                v.push(format!("пропущено кадров: {} из {}", drop, dec));
+            }
+            if p.fps > 0.0 {
+                v.push(format!("{:.0} к/с", p.fps));
+            }
         }
         v.join("   ·   ")
     }
@@ -605,6 +685,9 @@ impl MediaView {
 
     /// Текущий кадр (для «Кадр → фото»): по запросу, в полном размере.
     pub fn snapshot(&self) -> Option<Img> {
+        if let Some(p) = &self.soft {
+            return p.snapshot();
+        }
         let (d, e) = (self.d3d.as_ref()?, self.engine.as_ref()?);
         let (w, h) = self.native;
         if w == 0 || h == 0 {
@@ -770,6 +853,16 @@ pub fn audio_peaks(path: &Path, n: usize) -> Option<Vec<u8>> {
 
 /// Кадр видео (около 10% длительности) для миниатюры. Для фонового потока.
 pub fn video_thumb(path: &Path, max: u32) -> Option<Img> {
+    // HEVC без системного кодека — свой декодер
+    if crate::softvideo::needed(path) {
+        let mut f = std::fs::File::open(path).ok()?;
+        let moov = crate::mp4::read_moov(&mut f).ok()?;
+        return crate::mp4::hevc_thumb(&mut f, &moov, max);
+    }
+    video_thumb_mf(path, max)
+}
+
+fn video_thumb_mf(path: &Path, max: u32) -> Option<Img> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);

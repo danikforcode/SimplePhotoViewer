@@ -1,0 +1,49 @@
+[package]
+name = "spv_thumbs"
+version = "0.0.9-alpha"
+edition = "2021"
+license = "MIT"
+authors = ["danikforcode"]
+description = "Миниатюры в Проводнике для SimplePhotoViewer (IThumbnailProvider)"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies.windows-core]
+version = "0.58"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "implement",
+    "Data_Pdf",
+    "Foundation",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+]
+
+[dependencies.heic-decoder]
+version = "0.1.1"
+
+[dependencies.image-webp]
+version = "0.2.4"
+
+[dependencies.rusty_h265]
+version = "0.7.1"
+
+[dependencies.rav1d]
+version = "1.1.0"
+default-features = false
+features = ["bitdepth_8", "bitdepth_16"]

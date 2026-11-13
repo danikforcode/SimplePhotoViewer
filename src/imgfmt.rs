@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Свои маленькие декодеры форматов, которых нет в Windows: TGA, PNM (PPM/PGM/PBM),
 //! QOI. И запись ICO (иконки) — в Windows есть только чтение.
 //! Чистая логика без Win32, покрыта тестами.

@@ -1,8 +1,8 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Чтение/запись/масштабирование через WIC — кодеки, которые уже есть в Windows.
 //! Поэтому в exe нет ни одного декодера: JPEG, PNG, BMP, GIF, TIFF «бесплатно»;
-//! HEIC/WebP откроются, если в системе стоят соответствующие расширения.
+//! HEIC, AVIF, WebP и RAW открываются и без расширений Microsoft — своими декодерами (extcodec.rs).
 
 use crate::image_buf::Img;
 use std::path::Path;
@@ -41,55 +41,7 @@ fn read_orientation(frame: &IWICBitmapFrameDecode) -> u16 {
     }
 }
 
-/// Ориентация из EXIF JPEG напрямую (без WIC): надёжнее и не зависит от версии системы.
-fn jpeg_orientation(b: &[u8]) -> Option<u16> {
-    if b.len() < 4 || b[0] != 0xFF || b[1] != 0xD8 {
-        return None;
-    }
-    let mut i = 2;
-    while i + 4 <= b.len() {
-        if b[i] != 0xFF {
-            return None;
-        }
-        let marker = b[i + 1];
-        if marker == 0xD9 || marker == 0xDA {
-            return None;
-        }
-        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
-        if marker == 0xE1 && i + 10 <= b.len() && &b[i + 4..i + 10] == b"Exif\0\0" {
-            let end = (i + 2 + len).min(b.len());
-            return tiff_orientation(&b[i + 10..end]);
-        }
-        i += 2 + len;
-    }
-    None
-}
-
-fn tiff_orientation(t: &[u8]) -> Option<u16> {
-    let le = match t.get(0..2)? {
-        b"II" => true,
-        b"MM" => false,
-        _ => return None,
-    };
-    let r16 = |o: usize| -> Option<u16> {
-        let s = t.get(o..o + 2)?;
-        Some(if le { u16::from_le_bytes([s[0], s[1]]) } else { u16::from_be_bytes([s[0], s[1]]) })
-    };
-    let r32 = |o: usize| -> Option<u32> {
-        let s = t.get(o..o + 4)?;
-        Some(if le { u32::from_le_bytes([s[0], s[1], s[2], s[3]]) } else { u32::from_be_bytes([s[0], s[1], s[2], s[3]]) })
-    };
-    let ifd = r32(4)? as usize;
-    let n = r16(ifd)? as usize;
-    for k in 0..n {
-        let e = ifd + 2 + k * 12;
-        if r16(e)? == 0x0112 {
-            let v = r16(e + 8)?;
-            return (1..=8).contains(&v).then_some(v);
-        }
-    }
-    None
-}
+pub(crate) use crate::extcodec::jpeg_orientation;
 
 fn file_head(path: &Path) -> Vec<u8> {
     use std::io::Read;
@@ -127,16 +79,57 @@ pub fn load(path: &Path) -> Result<Img> {
             None => Err(Error::from(E_FAIL)),
         };
     }
-    unsafe {
-        let f = factory()?;
-        let p = crate::util::wpath(path);
-        let dec = f.CreateDecoderFromFilename(PCWSTR(p.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
-        decode(&f, &dec, jpeg_orientation(&file_head(path)))
+    let wic = unsafe {
+        (|| {
+            let f = factory()?;
+            let p = crate::util::wpath(path);
+            let dec = f.CreateDecoderFromFilename(PCWSTR(p.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
+            decode(&f, &dec, jpeg_orientation(&file_head(path)))
+        })()
+    };
+    // RAW: системный TIFF-декодер «открывает» многие RAW, но отдаёт крошечную
+    // миниатюру из первой папки; тогда лучше встроенный полноразмерный JPEG
+    if crate::kinds::is_raw_ext(&ext) {
+        if let Ok(bytes) = std::fs::read(path) {
+            let best = crate::extcodec::raw_jpegs(&bytes).iter().map(|j| j.2 as u64 * j.3 as u64).max().unwrap_or(0);
+            let wic_area = wic.as_ref().map(|i| i.w as u64 * i.h as u64).unwrap_or(0);
+            if best > 0 && wic_area * 10 < best * 8 {
+                if let Some(Ok(img)) = crate::extcodec::decode(&bytes, &ext) {
+                    return Ok(img);
+                }
+            }
+        }
+    }
+    match wic {
+        Ok(img) => Ok(img),
+        Err(e) => {
+            // в системе нет кодека (HEIC без HEVC, AVIF, WebP, RAW) — свои декодеры
+            let head = file_head(path);
+            if crate::extcodec::sniff(&head, &ext).is_none() {
+                return Err(e);
+            }
+            let bytes = std::fs::read(path).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
+            match crate::extcodec::decode(&bytes, &ext) {
+                Some(r) => r.map_err(|m| Error::new(E_FAIL, m)),
+                None => Err(e),
+            }
+        }
     }
 }
 
-/// Декодировать картинку из памяти (PNG/BMP/JPEG…).
+/// Декодировать картинку из памяти (PNG/BMP/JPEG… и свои форматы, если WIC не смог).
 pub fn load_bytes(bytes: &[u8]) -> Result<Img> {
+    match load_bytes_wic(bytes) {
+        Ok(i) => Ok(i),
+        Err(e) => match crate::extcodec::decode(bytes, "") {
+            Some(r) => r.map_err(|m| Error::new(E_FAIL, m)),
+            None => Err(e),
+        },
+    }
+}
+
+/// Только системный WIC (без своих декодеров).
+pub fn load_bytes_wic(bytes: &[u8]) -> Result<Img> {
     unsafe {
         let f = factory()?;
         let s = f.CreateStream()?;
@@ -271,9 +264,21 @@ pub fn save_full(img: &Img, path: &Path, quality: i32, dpi: f64) -> Result<()> {
     r
 }
 
+/// WebP без потерь (свой кодировщик: в Windows записи WebP нет).
+pub fn encode_webp(img: &Img) -> Result<Vec<u8>> {
+    let rgb: Vec<u8> = img.px.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+    let mut out = vec![];
+    image_webp::WebPEncoder::new(&mut out).encode(&rgb, img.w, img.h, image_webp::ColorType::Rgb8).map_err(|e| Error::new(E_FAIL, format!("WebP: {e}")))?;
+    Ok(out)
+}
+
 pub fn save_q(img: &Img, path: &Path, quality: i32) -> Result<()> {
     let ext = crate::util::ext_lower(path);
-    let data = if ext == "ico" { encode_ico(img)? } else { encode_mem(img, &ext, quality)? };
+    let data = match ext.as_str() {
+        "ico" => encode_ico(img)?,
+        "webp" => encode_webp(img)?,
+        _ => encode_mem(img, &ext, quality)?,
+    };
     // пишем во временный файл и переименовываем: исходник не испортится при сбое
     let tmp = path.with_extension("spv-tmp");
     std::fs::write(&tmp, &data).map_err(|e| Error::new(E_FAIL, e.to_string()))?;

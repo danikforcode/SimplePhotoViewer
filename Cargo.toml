@@ -1,9 +1,13 @@
 [package]
 name = "simple_photo_viewer"
-version = "0.0.8-alpha"
+version = "0.0.9-alpha"
 edition = "2021"
-license = "GPL-3.0-or-later"
+license = "MIT"
+authors = ["danikforcode"]
 description = "Лёгкий просмотрщик фото, PDF, документов, таблиц, кода, аудио и видео (нативный Win32)"
+
+[workspace]
+members = ["thumbs"]
 
 [dependencies.windows-core]
 version = "0.58"
@@ -22,6 +26,7 @@ features = [
     "Win32_System_DataExchange",
     "Win32_System_Ole",
     "Win32_System_Registry",
+    "Win32_Security",
     "Win32_System_Threading",
     "Win32_System_Console",
     "Win32_System_ProcessStatus",
@@ -34,6 +39,8 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Media_MediaFoundation",
+    "Win32_Media",
+    "Win32_Media_Audio",
     "Win32_System_Variant",
     "Win32_UI_Controls",
     "Win32_UI_Controls_RichEdit",
@@ -46,6 +53,7 @@ features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ]
 
@@ -68,8 +76,50 @@ version = "0.42"
 version = "0.13"
 default-features = false
 
+# Свои декодеры, когда в Windows нет кодека (всё на чистом Rust — собирается без C-компилятора)
+[dependencies.heic-decoder]
+version = "0.1.1"
+
+[dependencies.image-webp]
+version = "0.2.4"
+
+# AV1 (AVIF): перенос dav1d на Rust; без ассемблера — для сборки не нужен nasm
+# HEVC-видео без кодека Microsoft (чистый Rust)
+[dependencies.rusty_h265]
+version = "0.7.1"
+
+[dependencies.rav1d]
+version = "1.1.0"
+default-features = false
+features = ["bitdepth_8", "bitdepth_16"]
+
+# уже есть внутри lopdf/zip — для сжатой DLL миниатюр в exe
+[dependencies.flate2]
+version = "1"
+default-features = false
+features = ["rust_backend"]
+
 [build-dependencies]
 embed-resource = "2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# Тесты и отладка: библиотеки (декодеры) — с оптимизацией, иначе тесты идут минутами
+[profile.dev.package."*"]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+# Декодеры — на скорость (остальное — на размер): фото HEIC/AVIF открываются в 2–3 раза быстрее
+[profile.release.package.heic-decoder]
+opt-level = 3
+[profile.release.package.rav1d]
+opt-level = 3
+[profile.release.package.image-webp]
+opt-level = 3
+[profile.release.package.rusty_h265]
+opt-level = 3
+[profile.release.package.rusty_h265-accel]
+opt-level = 3
 
 # Профиль «минимальный размер»: именно он даёт ~0.3–1 МБ вместо мегабайт отладочной сборки
 [profile.release]

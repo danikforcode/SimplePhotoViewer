@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! «Размер и формат» — как «Изменить размер» в «Фотографиях» Windows:
 //! размер в точках или процентах (с замком пропорций), тип файла, качество,
 //! разрешение для печати. «Сохранить копию» не трогает открытое фото,
@@ -28,12 +28,13 @@ const ID_APPLY: u32 = 81;
 const ID_CANCEL: u32 = 82;
 
 /// Тип файла: подпись, расширение, есть ли «качество».
-const TYPES: [(&str, &str, bool); 7] = [
+const TYPES: [(&str, &str, bool); 8] = [
     ("JPEG", "jpg", true),
     ("PNG", "png", false),
     ("BMP", "bmp", false),
     ("TIFF", "tif", false),
     ("GIF", "gif", false),
+    ("WebP", "webp", false),
     ("JPEG XR", "jxr", true),
     ("HEIC", "heic", true),
 ];

@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Главное окно: шапка с вкладками (лента), холст, нижняя панель быстрых
 //! инструментов. Что показывается на холсте, зависит от типа файла:
 //! страницы (фото, PDF, документы), таблица, текст/код или аудио/видео.
@@ -85,6 +85,7 @@ const ID_SCROLL: u32 = 148;
 const ID_PRINT: u32 = 150;
 const ID_KEYS: u32 = 160;
 const ID_ABOUT: u32 = 161;
+const ID_ASSOC: u32 = 184;
 const ID_INSERT: u32 = 170;
 const ID_DEL_PAGE: u32 = 171;
 const ID_MOVE_L: u32 = 172;
@@ -583,25 +584,19 @@ impl App {
     fn confirm_discard(&mut self) -> bool {
         self.commit_pending();
         if self.text_dirty() {
-            let r = unsafe {
-                MessageBoxW(self.hwnd, w!("Текст изменён. Сохранить изменения?"), &HSTRING::from(APP_NAME), MB_YESNOCANCEL | MB_ICONQUESTION)
-            };
-            return match r {
-                IDYES => self.save_text(false),
-                IDNO => true,
-                _ => false,
+            return match crate::dialogs::save_changes(Some(self.hwnd), "Текст изменён. Сохранить изменения?") {
+                Some(true) => self.save_text(false),
+                Some(false) => true,
+                None => false,
             };
         }
         if !self.dirty {
             return true;
         }
-        let r = unsafe {
-            MessageBoxW(self.hwnd, w!("Есть несохранённые изменения. Сохранить?"), &HSTRING::from(APP_NAME), MB_YESNOCANCEL | MB_ICONQUESTION)
-        };
-        match r {
-            IDYES => self.save_as(false),
-            IDNO => true,
-            _ => false,
+        match crate::dialogs::save_changes(Some(self.hwnd), "Есть несохранённые изменения. Сохранить?") {
+            Some(true) => self.save_as(false),
+            Some(false) => true,
+            None => false,
         }
     }
 
@@ -1858,17 +1853,9 @@ impl App {
                 let next = if theme::cur().dark { Mode::Light } else { Mode::Dark };
                 self.set_theme(next)
             }
-            ID_KEYS => self.msg(KEYS, false),
-            ID_ABOUT => self.msg(
-                &format!(
-                    "{APP_NAME} {VERSION}\n\nЛёгкий просмотрщик: фото, PDF, документы, таблицы, тексты и код, аудио и видео.\n\
-                     Правка фото, коллаж, склейка PDF, печать, конвертация.\n\
-                     © 2026 Даниил Кочубейник\nЛицензия: GNU GPL v3 или новее. Гарантий нет.\n\n\
-                     Используются lopdf, calamine, zip, quick-xml, pulldown-cmark (MIT/Apache).\n\
-                     Кодеки и PDF — системные компоненты Windows."
-                ),
-                false,
-            ),
+            ID_KEYS => crate::dialogs::keys(self.hwnd, KEYS),
+            ID_ABOUT => crate::dialogs::about(self.hwnd),
+            ID_ASSOC => crate::assoc::dialog(self.hwnd),
             t if (ID_TAB0..ID_TAB0 + TABS.len() as u32).contains(&t) => {
                 let new = (t - ID_TAB0) as usize;
                 if new == TAB_DRAW && !matches!(self.ed.tool, ETool::Draw(_)) {
@@ -2074,6 +2061,7 @@ impl App {
                     b(ID_THEME_LIGHT, IC_SUN, "Светлая", "Светлая тема"),
                     b(ID_THEME_DARK, IC_MOON, "Тёмная", "Тёмная тема"),
                     s,
+                    b(ID_ASSOC, IC_SETTINGS, "По умолчанию", "Открывать файлы этой программой, миниатюры в Проводнике"),
                     b(ID_KEYS, IC_KEYBOARD, "Клавиши", "Горячие клавиши (F1)"),
                     b(ID_ABOUT, IC_INFO, "О программе", "О программе"),
                 ]);
@@ -2087,7 +2075,7 @@ impl App {
         let multi = self.pages.len() > 1;
         let can_rot = has || self.pages.get(self.cur).map(|p| p.is_docpage() && p.img.is_none()).unwrap_or(false);
         match id {
-            ID_OPEN | ID_KEYS | ID_ABOUT | ID_COLLAGE | ID_CANVAS | ID_MERGE | ID_CONVERT | ID_INSERT | ID_FULL | ID_MORE | ID_WORK => true,
+            ID_OPEN | ID_KEYS | ID_ABOUT | ID_ASSOC | ID_COLLAGE | ID_CANVAS | ID_MERGE | ID_CONVERT | ID_INSERT | ID_FULL | ID_MORE | ID_WORK => true,
             ID_THEME_SYS | ID_THEME_LIGHT | ID_THEME_DARK | ID_BOOK | ID_SCROLL | ID_CLOSE_FILE => true,
             ID_PASTE => matches!(self.mode(), Mode2::Pages | Mode2::Empty),
             ID_UNDO => match &self.viewer {
@@ -2228,23 +2216,57 @@ impl App {
     }
 }
 
-const KEYS: &str = "ДВА РЕЖИМА\n\
-Обзор — ← → листают файлы папки, по краям видны соседи.\n\
-Работа — Enter или кнопка «Читать / Править / Работать» (у документов, текстов, таблиц):\n\
-   документ — ← → страницы; текст — правка; таблица — ходить по ячейкам.\n\
-   Esc или «К файлам» — обратно в обзор. Alt+← → и Ctrl+PgUp/PgDn — соседний файл всегда.\n\n\
-Ctrl+O — открыть (можно несколько файлов)\nCtrl+S — сохранить\nCtrl+Shift+S — сохранить в PDF / как…\n\
-Ctrl+P — печать\nCtrl+C / Ctrl+V — копировать / вставить\nCtrl+W — закрыть файл\nCtrl+E — конвертация\n\n\
-Home / End — первая / последняя страница (в работе)\nCtrl+I — вставить фото/страницы\nDelete — удалить страницу\n\
-Ctrl+L / Ctrl+R — повернуть\nCtrl+H — отразить (в тексте — замена)\nCtrl+K — обрезка (Enter — применить, Esc — отмена)\n\
-Ctrl+Z — отменить\nCtrl+N — холст (рисовать, класть фото)\nCtrl+G — коллаж из открытых фото\nCtrl+M — объединить в PDF\n\n\
-Правка фото: Ctrl+A — выделить всё, Ctrl+D — снять, Shift/Alt — добавить/вычесть,\n\
-   Delete — залить выделенное белым, Ctrl+Shift+R — размер и формат\n\
-Рисование: Shift — ровно (45°, квадрат, круг), Ctrl+Z — штрих назад, Esc — готово\n\n\
-Текст: Ctrl+F — найти, F3 — далее, Ctrl+H — заменить\n\
-Медиа: пробел — пуск/пауза, Shift+← → — 5 с, ↑ ↓ — громкость, M — звук\n\
-Таблица: щелчок по заголовку — сортировка ▲ ▼ (файл не меняется)\n\n\
-Колесо мыши — масштаб (в прокрутке и таблице — листать; Ctrl+колесо — масштаб)\nДвойной клик — «Читать»; в работе — вписать\nF11 — во весь экран";
+/// Горячие клавиши: «РАЗДЕЛ» заглавными, дальше «клавиши — что делают».
+const KEYS: &str = "ОБЗОР И РАБОТА
+← → — листать файлы папки (в обзоре); по краям видны соседи
+Enter — «Читать / Править / Работать»: документ, текст, таблица
+Esc — обратно к файлам
+Alt+← → — соседний файл всегда (и Ctrl+PgUp / PgDn)
+Home / End — первая / последняя страница (в работе)
+Колесо мыши — масштаб; в прокрутке и таблице — листать
+Ctrl+колесо — масштаб в прокрутке
+Двойной клик — «Читать»; в работе — вписать
+F11 — во весь экран
+
+ФАЙЛ
+Ctrl+O — открыть (можно несколько файлов)
+Ctrl+S — сохранить
+Ctrl+Shift+S — сохранить как / в PDF
+Ctrl+P — печать
+Ctrl+W — закрыть файл
+Ctrl+E — конвертация
+Ctrl+C / Ctrl+V — копировать / вставить
+
+СТРАНИЦЫ И СОЗДАНИЕ
+Ctrl+I — вставить фото или страницы
+Delete — удалить страницу
+Ctrl+N — холст: рисовать, класть фото
+Ctrl+G — коллаж из открытых фото
+Ctrl+M — объединить в PDF
+
+ПРАВКА ФОТО
+Ctrl+L / Ctrl+R — повернуть
+Ctrl+H — отразить
+Ctrl+K — обрезка (Enter — применить, Esc — отмена)
+Ctrl+Shift+R — размер и формат
+Ctrl+A / Ctrl+D — выделить всё / снять выделение
+Shift / Alt — добавить к выделению / вычесть
+Delete — залить выделенное белым
+Shift — ровно при рисовании (45°, квадрат, круг)
+Ctrl+Z — отменить
+
+ТЕКСТ
+Ctrl+F / F3 — найти / найти далее
+Ctrl+H — заменить
+
+МЕДИА
+Пробел — пуск / пауза
+Shift+← → — перемотка на 5 с
+↑ ↓ — громкость
+M — без звука
+
+ТАБЛИЦА
+Щелчок по заголовку — сортировка ▲ ▼ (файл не меняется)";
 
 fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -2957,6 +2979,7 @@ impl Panel for App {
             TIMER_START => {
                 let s = std::mem::take(&mut self.start);
                 self.load_paths(&s);
+                crate::assoc::refresh_if_needed();
             }
             _ => {}
         }
@@ -3195,15 +3218,8 @@ impl App {
 }
 
 // ------------------------------------------------------------------ сервис ---
-pub fn message(hwnd: Option<HWND>, text: &str, error: bool) -> MESSAGEBOX_RESULT {
-    unsafe {
-        MessageBoxW(
-            hwnd.unwrap_or_default(),
-            &HSTRING::from(text),
-            &HSTRING::from(APP_NAME),
-            if error { MB_OK | MB_ICONERROR } else { MB_OK | MB_ICONINFORMATION },
-        )
-    }
+pub fn message(hwnd: Option<HWND>, text: &str, error: bool) {
+    crate::dialogs::message(hwnd, text, error);
 }
 
 fn save_placement(hwnd: HWND) {

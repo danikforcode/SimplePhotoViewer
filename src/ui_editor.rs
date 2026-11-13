@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Редактор фото в главном окне: выделение, панель «Настройка» с ползунками
 //! и живым просмотром, эффекты, рисование, обрезка с пропорциями.
 //! Это часть модуля ui (видит поля App).
@@ -424,21 +424,8 @@ impl App {
     }
 
     fn pick_color(&mut self) {
-        use windows::Win32::UI::Controls::Dialogs::*;
-        static mut CUSTOM: [COLORREF; 16] = [COLORREF(0xFFFFFF); 16];
-        unsafe {
-            let mut cc = CHOOSECOLORW {
-                lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
-                hwndOwner: self.hwnd,
-                rgbResult: rgb_to_colorref(self.ed.color),
-                lpCustColors: std::ptr::addr_of_mut!(CUSTOM) as *mut COLORREF,
-                Flags: CC_FULLOPEN | CC_RGBINIT,
-                ..Default::default()
-            };
-            if ChooseColorW(&mut cc).as_bool() {
-                let c = cc.rgbResult.0;
-                self.ed.color = ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
-            }
+        if let Some(c) = crate::dialogs::pick_color(self.hwnd, self.ed.color) {
+            self.ed.color = c;
         }
     }
 

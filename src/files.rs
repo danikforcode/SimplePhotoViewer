@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Диалоги открытия/сохранения и список соседних файлов папки.
 
 use crate::util::{from_wide, wide, wpath};
@@ -151,7 +151,8 @@ pub const PHOTO_FILTERS: &[(&str, &[&str])] = &[
     ("TIFF", &["tif", "tiff"]),
     ("GIF", &["gif"]),
     ("JPEG XR", &["jxr"]),
-    ("HEIC (нужно расширение HEIF)", &["heic"]),
+    ("WebP (без потерь)", &["webp"]),
+    ("HEIC (нужно расширение HEVC от Microsoft)", &["heic"]),
     ("Иконка ICO", &["ico"]),
     ("PDF", &["pdf"]),
 ];

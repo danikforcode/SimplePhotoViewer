@@ -1,5 +1,5 @@
-// SimplePhotoViewer (Rust/Win32) — Copyright (C) 2026 Даниил Кочубейник
-// Лицензия: GNU GPL v3 или новее. Гарантий нет.
+// SimplePhotoViewer (Rust/Win32) — © 2026 danikforcode
+// Лицензия MIT (см. LICENSE). Распространяется «как есть», без гарантий.
 //! Замеры и нагрузочная проверка без окна:
 //!   SimplePhotoViewer.exe --bench  [отчёт.txt]  — сколько длятся тяжёлые операции;
 //!   SimplePhotoViewer.exe --stress [циклов] [отчёт.txt] — тысячи циклов
@@ -181,6 +181,22 @@ pub fn bench(out: Option<PathBuf>) {
     let sh = shapes(200, 6000.0, 4000.0);
     row(&mut r, "Рисунок: 200 фигур → в фото 24 Мп (GDI+)", time(3, || crate::draw::flatten(&big, &sh)));
 
+    // ---- свои декодеры (когда в системе нет кодека)
+    for (name, file) in [("HEIC 2048×2048 (свой декодер HEVC)", "miaf003.heic"), ("AVIF 1204×800, 8 бит (rav1d)", "fox8.avif"), ("AVIF 1204×800, 10 бит (rav1d)", "fox10.avif")] {
+        let p = std::env::var("SPV_BENCH_DATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("tests/data")).join(file);
+        match std::fs::read(&p) {
+            Ok(b) => row(&mut r, name, time(3, || crate::extcodec::decode(&b, "").unwrap().unwrap())),
+            Err(_) => r.line(format!("{name:<46} нет файла {}", p.display())),
+        }
+    }
+    let webp = {
+        let mut enc = vec![];
+        let rgb: Vec<u8> = big.px.chunks(4).take(3000 * 2000).flat_map(|p| [p[2], p[1], p[0]]).collect();
+        let _ = image_webp::WebPEncoder::new(&mut enc).encode(&rgb, 3000, 2000, image_webp::ColorType::Rgb8);
+        enc
+    };
+    row(&mut r, "WebP 6 Мп без потерь (свой декодер)", time(3, || crate::extcodec::decode(&webp, "").unwrap().unwrap()));
+
     // ---- холст / коллаж
     let photos: Vec<Rc<Img>> = (0..8).map(|i| Rc::new(synth(3000, 2000 + (i % 2) * 1000, i + 2))).collect();
     let ink = shapes(50, 3840.0, 2160.0);
@@ -226,6 +242,24 @@ pub fn bench(out: Option<PathBuf>) {
     r.line(format!("Память в конце: {p1:.0} МБ своей, {w1:.0} МБ рабочий набор; GDI {g1}, USER {u1}"));
     let _ = std::fs::remove_dir_all(&dir);
     save_report(&r, out, "spv-bench.txt");
+}
+
+/// Проверить, чем и как открываются файлы: --probe файл…
+pub fn probe(files: &[PathBuf]) {
+    attach_console();
+    for f in files {
+        let ext = crate::util::ext_lower(f);
+        let t = Instant::now();
+        let wic = std::fs::read(f).map(|b| crate::codec::load_bytes_wic(&b).map(|i| (i.w, i.h)));
+        let t1 = ms(t.elapsed());
+        let t = Instant::now();
+        let own = std::fs::read(f).ok().and_then(|b| crate::extcodec::decode(&b, &ext)).map(|r| r.map(|i| (i.w, i.h)));
+        let t2 = ms(t.elapsed());
+        let t = Instant::now();
+        let full = crate::codec::load(f).map(|i| (i.w, i.h)).map_err(|e| e.message().to_string());
+        let t3 = ms(t.elapsed());
+        println!("{}:\n  WIC: {:?} ({t1:.0} мс)\n  свой: {:?} ({t2:.0} мс)\n  итог: {:?} ({t3:.0} мс)", f.display(), wic.map(|r| r.map_err(|e| e.message().to_string())), own, full);
+    }
 }
 
 /// Нагрузочная проверка: циклы правки и сохранения, следим за ростом ресурсов.
