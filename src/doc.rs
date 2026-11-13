@@ -142,7 +142,14 @@ pub fn render(page: &Page, dpi: f64) -> Result<Rc<Img>, String> {
         return Ok(i.clone());
     }
     let img = match &page.src {
-        Src::File(p) => crate::codec::load(p).map_err(|e| format!("{}:\n{}", file_name(p), e.message()))?,
+        Src::File(p) => match crate::prefetch::take(p) {
+            Some(i) => i,
+            None => {
+                let i = crate::codec::load(p).map_err(|e| format!("{}:\n{}", file_name(p), e.message()))?;
+                crate::prefetch::keep(p, &i);
+                i
+            }
+        },
         Src::Pdf { path, index, size } => {
             let k = (dpi / 72.0).min(MAX_SIDE / size.0.max(size.1).max(1.0));
             let w = (size.0 * k).round().max(16.0) as u32;

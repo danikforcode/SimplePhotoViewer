@@ -156,6 +156,7 @@ pub fn bench(out: Option<PathBuf>) {
     row(&mut r, "PNG 24 Мп: сохранить", time(1, || codec::save(&big, &png).unwrap()));
     row(&mut r, "JPEG 24 Мп: открыть", time(5, || codec::load(&jpg).unwrap()));
     row(&mut r, "PNG 24 Мп: открыть", time(3, || codec::load(&png).unwrap()));
+    row(&mut r, "JPEG 24 Мп: быстрый просмотр 360", time(5, || codec::load_small(&jpg, 360).unwrap()));
     row(&mut r, "Миниатюра 24 Мп → 1600", time(5, || codec::thumb(&big, 1600)));
     row(&mut r, "Размер 24 Мп → 1920×1280 (WIC)", time(5, || codec::resize(&big, 1920, 1280).unwrap()));
     row(&mut r, "Поворот 90° 24 Мп", time(5, || big.rotate_cw()));
@@ -188,6 +189,9 @@ pub fn bench(out: Option<PathBuf>) {
             Ok(b) => row(&mut r, name, time(3, || crate::extcodec::decode(&b, "").unwrap().unwrap())),
             Err(_) => r.line(format!("{name:<46} нет файла {}", p.display())),
         }
+    }
+    if let Ok(b) = std::fs::read(std::env::var("SPV_BENCH_DATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("tests/data")).join("miaf003.heic")) {
+        row(&mut r, "HEIC: встроенная миниатюра", time(5, || crate::extcodec::heic_thumb(&b, 16).unwrap()));
     }
     let webp = {
         let mut enc = vec![];
@@ -249,6 +253,10 @@ pub fn probe(files: &[PathBuf]) {
     attach_console();
     for f in files {
         let ext = crate::util::ext_lower(f);
+        if matches!(ext.as_str(), "mp4" | "mov" | "m4v") {
+            probe_video(f);
+            continue;
+        }
         let t = Instant::now();
         let wic = std::fs::read(f).map(|b| crate::codec::load_bytes_wic(&b).map(|i| (i.w, i.h)));
         let t1 = ms(t.elapsed());
@@ -260,6 +268,51 @@ pub fn probe(files: &[PathBuf]) {
         let t3 = ms(t.elapsed());
         println!("{}:\n  WIC: {:?} ({t1:.0} мс)\n  свой: {:?} ({t2:.0} мс)\n  итог: {:?} ({t3:.0} мс)", f.display(), wic.map(|r| r.map_err(|e| e.message().to_string())), own, full);
     }
+}
+
+/// Видео HEVC: сколько уходит на расшифровку и на перевод цветов (первые 120 кадров).
+fn probe_video(f: &std::path::Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(f) else { return };
+    let Some(mv) = crate::mp4::read_moov(&mut file).ok().and_then(|m| crate::mp4::parse(&m)) else {
+        println!("{}: не MP4/HEVC", f.display());
+        return;
+    };
+    let Some(t) = mv.video else {
+        println!("{}: нет дорожки HEVC", f.display());
+        return;
+    };
+    let mut dec = rusty_h265::Decoder::new();
+    for p in &t.params {
+        let _ = dec.push_nal(p, None);
+    }
+    let (mut td, mut tc, mut n) = (0.0, 0.0, 0usize);
+    let mut buf = vec![];
+    let mut size = (0, 0);
+    for smp in t.samples.iter().take(120) {
+        buf.resize(smp.size as usize, 0);
+        if file.seek(SeekFrom::Start(smp.offset)).is_err() || file.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let t0 = Instant::now();
+        for nal in crate::mp4::split_nals(&buf, t.nal_len) {
+            let _ = dec.push_nal(nal, Some(0));
+        }
+        let mut frames = vec![];
+        while let Ok(fr) = dec.next_frame() {
+            frames.push(fr);
+        }
+        td += ms(t0.elapsed());
+        for fr in frames {
+            size = (fr.picture.crop.2, fr.picture.crop.3);
+            let t1 = Instant::now();
+            let _ = crate::mp4::to_bgra(&fr, t.rotation, 1280, 720);
+            tc += ms(t1.elapsed());
+            n += 1;
+        }
+    }
+    let n1 = n.max(1) as f64;
+    println!("{}: {}×{}, {n} кадров; расшифровка {:.1} мс/кадр, цвета → 1280×720 {:.1} мс/кадр (нужно ≤ {:.1})", f.display(), size.0, size.1, td / n1, tc / n1, 1000.0 / t.fps.max(1.0));
 }
 
 /// Нагрузочная проверка: циклы правки и сохранения, следим за ростом ресурсов.

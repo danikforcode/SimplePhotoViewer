@@ -33,6 +33,8 @@ pub enum Prop {
 pub struct Heif {
     pub brands: Vec<[u8; 4]>,
     pub primary: u32,
+    /// Где в файле лежит номер главной картинки (смещение, байт: 2 или 4).
+    pub pitm_at: Option<(usize, usize)>,
     pub items: Vec<Item>,
     pub props: Vec<Prop>,
     /// (тип ссылки, откуда, куда…)
@@ -150,6 +152,7 @@ pub fn parse(file: &[u8]) -> Result<Heif, String> {
             b"pitm" => {
                 let (v, _) = full(&mut r).ok_or_else(bad)?;
                 h.primary = if v == 0 { r.u16().ok_or_else(bad)? as u32 } else { r.u32().ok_or_else(bad)? };
+                h.pitm_at = Some((b.as_ptr() as usize - file.as_ptr() as usize + 4, if v == 0 { 2 } else { 4 }));
             }
             b"iinf" => {
                 let (v, _) = full(&mut r).ok_or_else(bad)?;

@@ -83,9 +83,15 @@ impl Pager {
                     };
                     let img = match &req.job {
                         Job::Pdf { path, index, width } => crate::pdf_read::render(path, *index, *width),
-                        Job::File { path, max } => crate::codec::load(path)
-                            .map(|i| if *max > 0 && i.w.max(i.h) > *max { crate::codec::thumb(&i, *max) } else { i })
-                            .map_err(|e| e.message().to_string()),
+                        Job::File { path, max } => match crate::prefetch::take(path) {
+                            Some(i) => Ok(i),
+                            None => crate::codec::load(path).map(|i| {
+                                crate::prefetch::keep(path, &i);
+                                i
+                            }),
+                        }
+                        .map(|i| if *max > 0 && i.w.max(i.h) > *max { crate::codec::thumb(&i, *max) } else { i })
+                        .map_err(|e| e.message().to_string()),
                     }
                     .map(|i| crate::doc::rot_q(i, req.rot));
                     sh.0.lock().unwrap().busy.retain(|b| *b != (req.gen, req.page, req.key));

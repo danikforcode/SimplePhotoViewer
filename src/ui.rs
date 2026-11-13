@@ -202,6 +202,8 @@ pub struct App {
     page_err: HashMap<usize, String>,
     /// На экране — временная (грубая) картинка страницы, точная рисуется.
     view_pending: bool,
+    /// Во сколько раз полный снимок больше показанной миниатюры (HEIC, пока грузится).
+    view_ratio: f64,
 }
 
 fn key_down(vk: i32) -> bool {
@@ -217,7 +219,7 @@ impl App {
             hq: true, tab: settings::get_i("tab", 0).clamp(0, 4) as usize, full: None, status: String::new(),
             scroll_mode: settings::get_i("doc_scroll", 0) == 1, work: false, sy: 0.0, page_cache: HashMap::new(), page_thumbs: HashMap::new(),
             peeker: None, peek_l: RECT::default(), peek_r: RECT::default(), peek_hover: 0, anim: None, overflow: vec![],
-            ed: Editor::new(), full_hover: false, pager: None, page_err: HashMap::new(), view_pending: false,
+            ed: Editor::new(), full_hover: false, pager: None, page_err: HashMap::new(), view_pending: false, view_ratio: 1.0,
         }
     }
 
@@ -256,7 +258,7 @@ impl App {
                 let pad = if self.full.is_some() { 0.0 } else { 16.0 };
                 let f = ((self.cw() - pad) / i.w as f64).min((self.ch() - pad) / i.h as f64).max(0.001);
                 // документы вписываем всегда, мелкие фото не растягиваем
-                if self.pages.get(self.cur).map(|p| p.is_docpage()).unwrap_or(false) { f } else { f.min(1.0) }
+                if self.pages.get(self.cur).map(|p| p.is_docpage()).unwrap_or(false) { f } else { f.min(if self.view_pending { self.view_ratio } else { 1.0 }) }
             }
             None => 1.0,
         }
@@ -379,6 +381,7 @@ impl App {
                             let w = self.page_job(self.cur, self.book_px(self.cur)).map(|j| j.0 as f64).unwrap_or(pw);
                             (w, w * ph / pw.max(1.0))
                         }
+                        _ if self.view_pending => (v.w as f64 * self.view_ratio, v.h as f64 * self.view_ratio),
                         _ => (v.w as f64, v.h as f64),
                     };
                     parts.push(format!("{} × {} px", w.round(), h.round()));
@@ -518,6 +521,7 @@ impl App {
             return;
         }
         self.view_pending = false;
+        self.view_ratio = 1.0;
         let cur = self.cur;
         let Some(p) = self.pages.get(cur) else { return };
         // PDF: если готовой страницы нет — сразу грубый набросок, точная — в фоне
@@ -553,11 +557,47 @@ impl App {
             }
             return;
         }
+        // HEIC: сразу встроенная миниатюра, полный снимок — в фоне
+        if let (Src::File(path), None, Some(pg)) = (&p.src, &p.img, &self.pager) {
+            if let Some((t, full_long)) = Self::heic_preview(path) {
+                self.view_ratio = full_long as f64 / t.w.max(t.h).max(1) as f64;
+                self.view = Some(Rc::new(doc::rot_q(t, p.rot)));
+                self.view_pending = true;
+                pg.want(cur, u32::MAX, p.rot, crate::pager::Job::File { path: path.clone(), max: 0 });
+                return;
+            }
+        }
         match doc::render(p, doc::VIEW_DPI) {
             Ok(i) => self.view = Some(i),
             Err(e) => self.view_err = Some(e),
         }
         self.prefetch_book();
+    }
+
+    /// Встроенная миниатюра HEIC, если полного снимка ещё нет в памяти.
+    fn heic_preview(path: &Path) -> Option<(Img, u32)> {
+        if crate::prefetch::ready_or_busy(path) {
+            return None;
+        }
+        let head = {
+            use std::io::Read;
+            let mut b = vec![0u8; 64];
+            let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut b)).ok()?;
+            b.truncate(n);
+            b
+        };
+        if !matches!(crate::extcodec::sniff(&head, &crate::util::ext_lower(path)), Some(crate::extcodec::Sniff::Heic)) {
+            return None;
+        }
+        // системный декодер HEIC (если есть) и так быстр — но миниатюра ещё быстрее
+        let bytes = std::fs::read(path).ok()?;
+        let t = crate::extcodec::heic_thumb(&bytes, 160)?;
+        let h = crate::heif::parse(&bytes).ok()?;
+        let full = h.props_of(h.primary).iter().find_map(|p| match p {
+            crate::heif::Prop::Ispe(w, h) => Some((*w).max(*h)),
+            _ => None,
+        })?;
+        Some((t, full))
     }
 
     /// Заранее нарисовать соседние страницы — листание будет мгновенным.
@@ -628,6 +668,10 @@ impl App {
 
     fn set_siblings(&mut self, path: Option<&Path>) {
         match path {
+            // та же папка, файл уже в списке — не перечитывать папку (большие папки — долго)
+            Some(p) if self.idx >= 0 && self.files.iter().any(|f| f == p) => {
+                self.idx = self.files.iter().position(|f| f == p).unwrap() as isize;
+            }
             Some(p) => {
                 let (list, idx) = files::siblings(p);
                 self.files = list;
@@ -730,6 +774,7 @@ impl App {
             let n = pages.len();
             let name = if n > 1 { format!("{} ({} стр.)", file_name(&paged[0]), n) } else { file_name(&paged[0]) };
             self.set_doc(pages, name, Some(paged[0].clone()), false);
+            self.prefetch_neighbors(1);
         } else {
             let name = format!("Документ ({} стр.)", pages.len());
             self.set_doc(pages, name, None, false);
@@ -1006,6 +1051,21 @@ impl App {
         let p = self.files[j as usize].clone();
         self.load_paths(&[p]);
         self.start_anim(old, d as f64);
+        self.prefetch_neighbors(d);
+    }
+
+    /// Расшифровать заранее соседей (сначала — в сторону, куда листают).
+    fn prefetch_neighbors(&self, dir: isize) {
+        if self.idx < 0 || self.kind != Some(FK::Image) {
+            return;
+        }
+        let d = if dir < 0 { -1 } else { 1 };
+        let list: Vec<PathBuf> = [self.idx + d, self.idx - d, self.idx + 2 * d]
+            .iter()
+            .filter(|&&i| i >= 0 && (i as usize) < self.files.len())
+            .map(|&i| self.files[i as usize].clone())
+            .collect();
+        crate::prefetch::want(&list);
     }
 
     fn go_home(&mut self, end: bool) {

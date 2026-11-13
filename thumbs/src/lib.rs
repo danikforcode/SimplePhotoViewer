@@ -444,6 +444,12 @@ fn own(bytes: &[u8], ext: &str, cx: u32) -> Option<Img> {
             return Some(fit(i, cx));
         }
     }
+    // HEIC: встроенной миниатюры хватает для значков Проводника (до ~256)
+    if matches!(extcodec::sniff(bytes, ext), Some(extcodec::Sniff::Heic)) {
+        if let Some(i) = extcodec::heic_thumb(bytes, cx) {
+            return Some(fit(i, cx));
+        }
+    }
     if let Ok(i) = codec::wic(bytes, cx) {
         return Some(i);
     }

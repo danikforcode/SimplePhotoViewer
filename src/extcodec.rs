@@ -86,6 +86,42 @@ fn heic(bytes: &[u8]) -> Result<Img, String> {
     }
 }
 
+/// Встроенная в HEIC миниатюра (iPhone кладёт ~320×240), если её длинная
+/// сторона не меньше `min_long`. Расшифровывается в десятки раз быстрее
+/// полного снимка: подменяем в копии файла номер главной картинки (pitm)
+/// на номер миниатюры и отдаём её тому же декодеру.
+pub fn heic_thumb(bytes: &[u8], min_long: u32) -> Option<Img> {
+    let h = crate::heif::parse(bytes).ok()?;
+    let (at, n) = h.pitm_at?;
+    let mut best: Option<(u32, u32)> = None;
+    for (kind, from, to) in &h.refs {
+        if kind != b"thmb" || !to.contains(&h.primary) {
+            continue;
+        }
+        let it = h.item(*from)?;
+        if &it.kind != b"hvc1" {
+            continue;
+        }
+        let side = h.props_of(*from).iter().find_map(|p| match p {
+            crate::heif::Prop::Ispe(w, hh) => Some((*w).max(*hh)),
+            _ => None,
+        })?;
+        if side >= min_long && best.map_or(true, |b| side > b.1) {
+            best = Some((*from, side));
+        }
+    }
+    let (id, _) = best?;
+    if n == 2 && id > 0xFFFF {
+        return None;
+    }
+    let mut b = bytes.to_vec();
+    match n {
+        2 => b.get_mut(at..at + 2)?.copy_from_slice(&(id as u16).to_be_bytes()),
+        _ => b.get_mut(at..at + 4)?.copy_from_slice(&id.to_be_bytes()),
+    }
+    heic(&b).ok()
+}
+
 // ---------------------------------------------------------------- WebP ---
 fn webp(bytes: &[u8]) -> Result<Img, String> {
     let mut d = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| format!("WebP: {e}"))?;
@@ -287,6 +323,15 @@ mod tests {
         assert_eq!((found[0].2, found[0].3), (200, 150));
         let back = raw_preview(&raw).unwrap();
         assert_eq!((back.w, back.h), (200, 150));
+    }
+
+    #[test]
+    fn heic_embedded_thumb() {
+        let b = std::fs::read(format!("{}/tests/data/miaf003.heic", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let full = decode(&b, "heic").unwrap().unwrap();
+        let t = heic_thumb(&b, 16).expect("миниатюра");
+        assert!(t.w < full.w && t.h < full.h, "{}x{} vs {}x{}", t.w, t.h, full.w, full.h);
+        assert!(heic_thumb(&b, 100_000).is_none());
     }
 
     #[test]

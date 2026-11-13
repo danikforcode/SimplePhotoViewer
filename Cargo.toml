@@ -1,6 +1,6 @@
 [package]
 name = "simple_photo_viewer"
-version = "0.0.9-alpha"
+version = "0.0.10-alpha"
 edition = "2021"
 license = "MIT"
 authors = ["danikforcode"]

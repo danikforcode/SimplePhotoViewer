@@ -109,7 +109,7 @@ fn read_head(p: &Path, n: usize) -> Option<Vec<u8>> {
 fn make(p: &Path) -> Peek {
     let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     match kinds::kind_of(p) {
-        Some(Kind::Image) => crate::codec::load(p).map(|i| Peek::Img(crate::codec::thumb(&i, 360))).unwrap_or(Peek::Icon),
+        Some(Kind::Image) => crate::codec::load_small(p, 360).map(Peek::Img).unwrap_or(Peek::Icon),
         Some(Kind::Pdf) => crate::pdf_read::render(p, 0, 300).map(Peek::Img).unwrap_or(Peek::Icon),
         Some(Kind::Video) => crate::media::video_thumb(p, 360).map(Peek::Img).unwrap_or(Peek::Icon),
         Some(Kind::Audio) if size < 80_000_000 => crate::media::audio_peaks(p, 160).map(Peek::Wave).unwrap_or(Peek::Icon),

@@ -589,6 +589,7 @@ impl MediaView {
             if p.fps > 0.0 {
                 v.push(format!("{:.0} к/с", p.fps));
             }
+            v.push(if p.gpu() { "HEVC · Direct3D".into() } else { "HEVC".into() });
         }
         v.join("   ·   ")
     }

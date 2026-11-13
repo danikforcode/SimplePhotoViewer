@@ -69,7 +69,7 @@ fn probe_codec(path: &Path) -> Option<[u8; 4]> {
 // ------------------------------------------------------- общее состояние ---
 struct Frame {
     pts: f64,
-    img: Img,
+    fr: rusty_h265::Frame,
 }
 
 struct Shared {
@@ -85,7 +85,11 @@ struct Shared {
     queue: Mutex<VecDeque<(u32, Frame)>>,
     cv: Condvar,
     /// Последний показанный кадр (для снимка и перерисовки).
-    shown: Mutex<Option<Arc<Img>>>,
+    shown: Mutex<Option<rusty_h265::Frame>>,
+    /// Поворот кадра (градусы по часовой).
+    rot: u32,
+    /// Кадры рисует видеокарта (Direct3D 11), а не GDI.
+    gpu: AtomicBool,
     redraw: AtomicBool,
     /// Область показа (размер окна-экрана).
     size: Mutex<(i32, i32)>,
@@ -189,6 +193,8 @@ impl SoftPlayer {
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             shown: Mutex::new(None),
+            rot: track.rotation,
+            gpu: AtomicBool::new(false),
             redraw: AtomicBool::new(true),
             size: Mutex::new((64, 64)),
             clock: Mutex::new(Clock { base: 0.0, start: Some(Instant::now()), audio: None }),
@@ -303,8 +309,15 @@ impl SoftPlayer {
         self.sh.volume.store((v.clamp(0.0, 1.0) * 1000.0) as u32, Relaxed);
     }
 
+    /// Текущий кадр в полном размере.
     pub fn snapshot(&self) -> Option<Img> {
-        self.sh.shown.lock().unwrap().as_ref().map(|i| (**i).clone())
+        let fr = self.sh.shown.lock().unwrap().clone()?;
+        Some(to_bgra(&fr, self.sh.rot, u32::MAX, u32::MAX))
+    }
+
+    /// Рисует ли видеокарта.
+    pub fn gpu(&self) -> bool {
+        self.sh.gpu.load(Relaxed)
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -327,8 +340,10 @@ impl Drop for SoftPlayer {
 }
 
 // ------------------------------------------------------------ декодер ---
-/// Сколько готовых кадров держать впереди.
-const AHEAD: usize = 6;
+/// Сколько готовых кадров держать впереди (4K — меньше: кадр ~25 МБ).
+fn ahead(w: u32, h: u32) -> usize {
+    if w as u64 * h as u64 > 4_000_000 { 3 } else { 6 }
+}
 
 fn decode_loop(sh: Arc<Shared>, mut f: std::fs::File, t: mp4::Track) {
     let mut dec = rusty_h265::Decoder::new();
@@ -360,7 +375,7 @@ fn decode_loop(sh: Arc<Shared>, mut f: std::fs::File, t: mp4::Track) {
         // очередь полна — ждём
         {
             let q = sh.queue.lock().unwrap();
-            if q.len() >= AHEAD {
+            if q.len() >= ahead(t.width, t.height) {
                 let _ = sh.cv.wait_timeout(q, Duration::from_millis(20));
                 continue;
             }
@@ -402,11 +417,10 @@ fn decode_loop(sh: Arc<Shared>, mut f: std::fs::File, t: mp4::Track) {
                 sh.dropped.fetch_add(1, Relaxed);
                 continue;
             }
-            let (dw, dh) = *sh.size.lock().unwrap();
-            let img = to_bgra(&fr, t.rotation, dw.max(1) as u32, dh.max(1) as u32);
+            // цвета переводит поток показа (или видеокарта) — декодер не ждёт
             let mut q = sh.queue.lock().unwrap();
             if gen == sh.gen.load(Relaxed) {
-                q.push_back((gen, Frame { pts, img }));
+                q.push_back((gen, Frame { pts, fr }));
             }
         }
     }
@@ -416,7 +430,14 @@ pub use crate::mp4::to_bgra;
 
 // ------------------------------------------------------------ показ ---
 fn present_loop(sh: Arc<Shared>, hwnd: HWND) {
-    let mut cur: Option<(f64, Arc<Img>)> = None;
+    let mut cur: Option<(f64, rusty_h265::Frame)> = None;
+    // GDI: кадр, уже переведённый в цвета под размер окна
+    let mut rgb: Option<((i32, i32), Img)> = None;
+    let mut gpu = {
+        let (w, h) = *sh.size.lock().unwrap();
+        crate::gpuvideo::Gpu::new(hwnd, w, h)
+    };
+    sh.gpu.store(gpu.is_some(), Relaxed);
     let mut shown_gen = u32::MAX;
     while !sh.stop.load(Relaxed) {
         let now = sh.clock.lock().unwrap().now();
@@ -429,16 +450,37 @@ fn present_loop(sh: Arc<Shared>, hwnd: HWND) {
             if shown_gen != gen {
                 // после открытия или перемотки — сразу первый кадр (и на паузе тоже)
                 if let Some((_, f)) = q.pop_front() {
+                    // без звука часы пускаем с первого кадра: пока декодер
+                    // разгонялся, время не должно было уйти вперёд
+                    let mut c = sh.clock.lock().unwrap();
+                    if c.audio.is_none() && c.start.is_some() {
+                        c.base = f.pts;
+                        c.start = Some(Instant::now());
+                    }
+                    drop(c);
                     pick = Some(f);
                     shown_gen = gen;
                 }
             } else if playing {
-                // последний кадр, которому уже пора; более ранние — пропущены
+                // со звуком: последний кадр, которому уже пора, более ранние — пропущены
+                // (картинка не отстаёт от звука); без звука — по одному кадру,
+                // а часы подождут: видео идёт медленнее, но плавно
+                let wall = sh.clock.lock().unwrap().audio.is_none();
                 while q.front().map(|(_, f)| f.pts <= now + 0.004).unwrap_or(false) {
                     if pick.is_some() {
                         sh.dropped.fetch_add(1, Relaxed);
                     }
                     pick = q.pop_front().map(|x| x.1);
+                    if wall {
+                        break;
+                    }
+                }
+                if let (true, Some(f)) = (wall, &pick) {
+                    let mut c = sh.clock.lock().unwrap();
+                    if c.audio.is_none() && c.start.is_some() && c.now() > f.pts + 0.02 {
+                        c.base = f.pts;
+                        c.start = Some(Instant::now());
+                    }
                 }
             }
             sh.cv.notify_all();
@@ -461,13 +503,35 @@ fn present_loop(sh: Arc<Shared>, hwnd: HWND) {
         }
         let fresh = pick.is_some();
         if let Some(f) = pick {
-            let img = Arc::new(f.img);
-            cur = Some((f.pts, img.clone()));
-            *sh.shown.lock().unwrap() = Some(img);
+            *sh.shown.lock().unwrap() = Some(f.fr.clone());
+            cur = Some((f.pts, f.fr));
+            rgb = None;
+            if let (Some(g), Some((_, fr))) = (&mut gpu, &cur) {
+                if !g.load(fr) {
+                    gpu = None;
+                    sh.gpu.store(false, Relaxed);
+                }
+            }
         }
         if fresh || sh.redraw.swap(false, Relaxed) {
-            if let Some((_, img)) = &cur {
-                draw(hwnd, img, *sh.size.lock().unwrap());
+            if let Some((_, fr)) = &cur {
+                let size = *sh.size.lock().unwrap();
+                let ok = match &mut gpu {
+                    Some(g) => g.draw(fr, sh.rot, size),
+                    None => false,
+                };
+                if !ok {
+                    if gpu.take().is_some() {
+                        // видеокарта отказала (сброс драйвера и т. п.) — дальше через GDI
+                        sh.gpu.store(false, Relaxed);
+                    }
+                    if rgb.as_ref().map(|r| r.0 != size).unwrap_or(true) {
+                        rgb = Some((size, to_bgra(fr, sh.rot, size.0.max(1) as u32, size.1.max(1) as u32)));
+                    }
+                    if let Some((_, img)) = &rgb {
+                        draw(hwnd, img, size);
+                    }
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(3));

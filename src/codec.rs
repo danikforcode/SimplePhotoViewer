@@ -308,6 +308,63 @@ pub fn resize(img: &Img, nw: u32, nh: u32) -> Result<Img> {
     }
 }
 
+/// Быстрая уменьшенная копия файла, вписанная в max×max: для HEIC —
+/// встроенная миниатюра, для JPEG и др. — уменьшение прямо при чтении
+/// (WIC сжимает JPEG ещё на этапе DCT, это в разы быстрее полного декода).
+/// Если не вышло — обычная загрузка и уменьшение.
+pub fn load_small(path: &Path, max: u32) -> Result<Img> {
+    let ext = crate::util::ext_lower(path);
+    let head = file_head(path);
+    let raw = crate::kinds::is_raw_ext(&ext);
+    match crate::extcodec::sniff(&head, &ext) {
+        Some(crate::extcodec::Sniff::Heic) => {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(t) = crate::extcodec::heic_thumb(&bytes, max * 3 / 4) {
+                    return Ok(thumb(&t, max));
+                }
+            }
+        }
+        None if !raw => {
+            let r = unsafe {
+                (|| -> Result<Img> {
+                    let f = factory()?;
+                    let p = crate::util::wpath(path);
+                    let dec = f.CreateDecoderFromFilename(PCWSTR(p.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
+                    let frame = dec.GetFrame(0)?;
+                    let orient = jpeg_orientation(&head).unwrap_or_else(|| read_orientation(&frame));
+                    let (mut w, mut h) = (0u32, 0u32);
+                    frame.GetSize(&mut w, &mut h)?;
+                    if w == 0 || h == 0 {
+                        return Err(Error::from(E_FAIL));
+                    }
+                    let k = (max as f64 / w as f64).min(max as f64 / h as f64);
+                    let src: IWICBitmapSource = if k < 1.0 {
+                        let (nw, nh) = (((w as f64 * k).round() as u32).max(1), ((h as f64 * k).round() as u32).max(1));
+                        let sc = f.CreateBitmapScaler()?;
+                        sc.Initialize(&frame, nw, nh, WICBitmapInterpolationModeFant)?;
+                        sc.cast()?
+                    } else {
+                        frame.cast()?
+                    };
+                    let conv = f.CreateFormatConverter()?;
+                    conv.Initialize(&src, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+                    conv.GetSize(&mut w, &mut h)?;
+                    let mut px = vec![0u8; w as usize * h as usize * 4];
+                    conv.CopyPixels(std::ptr::null(), w * 4, &mut px)?;
+                    let mut img = Img { w, h, px };
+                    img.flatten_white();
+                    Ok(img.apply_exif(orient))
+                })()
+            };
+            if r.is_ok() {
+                return r;
+            }
+        }
+        _ => {}
+    }
+    load(path).map(|i| thumb(&i, max))
+}
+
 /// Уменьшенная копия, вписанная в max×max (не увеличивает).
 pub fn thumb(img: &Img, max: u32) -> Img {
     let k = (max as f64 / img.w as f64).min(max as f64 / img.h as f64);

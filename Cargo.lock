@@ -844,7 +844,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simple_photo_viewer"
-version = "0.0.9-alpha"
+version = "0.0.10-alpha"
 dependencies = [
  "calamine",
  "embed-resource",
@@ -869,7 +869,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "spv_thumbs"
-version = "0.0.9-alpha"
+version = "0.0.10-alpha"
 dependencies = [
  "heic-decoder",
  "image-webp",

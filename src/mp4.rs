@@ -386,6 +386,28 @@ pub fn to_bgra(fr: &rusty_h265::Frame, rot: u32, max_w: u32, max_h: u32) -> Img 
             scope.spawn(move || {
                 for (dy, row) in band.chunks_exact_mut(ow * 4).enumerate() {
                     let ry = my[bi * per + dy];
+                    if rot == 0 {
+                        // частый случай — без поворота: строки источника берём один раз
+                        let y = ry + cy;
+                        let yrow = &p.planes[0].data[y * p.planes[0].stride..];
+                        let (urow, vrow): (&[u16], &[u16]) = if mono {
+                            (&[], &[])
+                        } else {
+                            let uy = y >> ys;
+                            (&p.planes[1].data[uy * p.planes[1].stride..], &p.planes[2].data[uy * p.planes[2].stride..])
+                        };
+                        for (px, &rx) in row.chunks_exact_mut(4).zip(mx.iter()) {
+                            let x = rx + cx;
+                            let yy = (yrow[x] >> shift) as i32;
+                            let (u, v) = if mono { (128, 128) } else { ((urow[x >> xs] >> shift) as i32, (vrow[x >> xs] >> shift) as i32) };
+                            let c = (yy - 16) * 298;
+                            let (d, e) = (u - 128, v - 128);
+                            px[2] = ((c + 459 * e + 128) >> 8).clamp(0, 255) as u8;
+                            px[1] = ((c - 55 * d - 136 * e + 128) >> 8).clamp(0, 255) as u8;
+                            px[0] = ((c + 541 * d + 128) >> 8).clamp(0, 255) as u8;
+                        }
+                        continue;
+                    }
                     for (ox, px) in row.chunks_exact_mut(4).enumerate() {
                         let rx = mx[ox];
                         // точка исходного кадра для точки (rx, ry) повёрнутого
